@@ -1,0 +1,5 @@
+{
+  "BUCKET_NAME": "us-market-data-casper",
+  "SECRET_NAME": "massive/api-key",
+  "SNS_TOPIC_ARN": "arn:aws:sns:us-west-2:123456789012:us-market-data-alerts"
+}

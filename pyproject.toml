@@ -1,0 +1,11 @@
+[project]
+name = "us-market-data"
+version = "0.1.0"
+description = "US market data ingestion, transform, ETF curation, and metadata pipeline"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

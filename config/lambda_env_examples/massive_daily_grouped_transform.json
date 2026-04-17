@@ -1,0 +1,6 @@
+{
+  "BUCKET_NAME": "us-market-data-casper",
+  "RAW_PREFIX": "raw/massive/daily_market_summary",
+  "STAGING_PREFIX": "staging/market_bars",
+  "SNS_TOPIC_ARN": "arn:aws:sns:us-west-2:123456789012:us-market-data-alerts"
+}

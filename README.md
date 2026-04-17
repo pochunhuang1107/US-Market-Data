@@ -1,0 +1,176 @@
+# US Market Data
+
+Data infrastructure repo for the US market data pipeline that feeds the ETF-first simulation platform.
+
+This repo is based on your current production flow:
+- raw grouped daily market summary ingestion
+- monthly full-market staging parquet transform
+- ETF-only curated parquet update
+- ETF symbol metadata maintenance
+
+## Scope
+
+Current scope:
+- Full-market raw ingestion
+- Full-market staging transform
+- ETF-only curation to app-facing parquet
+- ETF symbol metadata parquet for app lookup
+- Manual/backfill scripts for curation and metadata bootstrap
+
+Deferred on purpose:
+- Daily all-stock curated lambda
+- Request-time parquet scans for symbol history
+- Mixing app repo and data infra repo
+
+## Current S3 layout
+
+- `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
+- `staging/market_bars/year=YYYY/month=MM/data.parquet`
+- `curated/etf_daily_prices/symbol=SYMBOL/year=YYYY/data.parquet`
+- `curated/reference/etf_symbol_metadata/data.parquet`
+
+## Repo structure
+
+```text
+lambdas/
+  massive_daily_grouped_ingest/
+  massive_daily_grouped_transform/
+  etf_parquet_update/
+scripts/
+  backfill_curated_etf_from_staging.py
+  bootstrap_etf_symbol_metadata.py
+  validate_etf_symbol_metadata.py
+  package_lambda.sh
+src/us_market_data/
+  s3_paths.py
+  etf_metadata.py
+requirements/
+  lambda.txt
+  scripts.txt
+config/
+  etf_symbols.example.txt
+  lambda_env_examples/
+docs/
+  DATA_CONTRACT.md
+```
+
+## Metadata design
+
+Metadata parquet path:
+- `curated/reference/etf_symbol_metadata/data.parquet`
+
+Schema:
+- `symbol`
+- `first_available_date`
+- `last_available_date`
+- `updated_at`
+
+Operational model:
+- bootstrap script computes first + last dates from existing curated ETF parquet
+- daily ETF curation lambda updates:
+  - `last_available_date`
+  - `updated_at`
+  - inserts new symbols if needed
+- `first_available_date` is preserved after bootstrap unless a brand-new symbol appears
+
+## Recommended workflow
+
+### 1. Bootstrap curated ETF parquet if needed
+
+Use existing staging monthly parquet as source.
+
+```bash
+python scripts/backfill_curated_etf_from_staging.py \
+  --bucket us-market-data-casper \
+  --staging-prefix staging/market_bars \
+  --curated-prefix curated/etf_daily_prices \
+  --symbols-file config/etf_symbols.example.txt \
+  --start-month 2018-01 \
+  --end-month 2026-04
+```
+
+### 2. Bootstrap ETF metadata parquet
+
+```bash
+python scripts/bootstrap_etf_symbol_metadata.py \
+  --bucket us-market-data-casper \
+  --curated-prefix curated/etf_daily_prices \
+  --metadata-key curated/reference/etf_symbol_metadata/data.parquet
+```
+
+### 3. Validate metadata against curated ETF files
+
+```bash
+python scripts/validate_etf_symbol_metadata.py \
+  --bucket us-market-data-casper \
+  --curated-prefix curated/etf_daily_prices \
+  --metadata-key curated/reference/etf_symbol_metadata/data.parquet
+```
+
+### 4. Deploy lambdas
+
+Package each lambda with:
+
+```bash
+./scripts/package_lambda.sh massive_daily_grouped_ingest
+./scripts/package_lambda.sh massive_daily_grouped_transform
+./scripts/package_lambda.sh etf_parquet_update
+```
+
+Artifacts will be created under `dist/`.
+
+## Lambda schedules
+
+Recommended mapping from your current schedule:
+
+- `massive-daily-grouped-ingest`
+  - weekday 4:30 PM New York time for `close`
+  - Tue-Sat 4:30 AM New York time for `finalize`
+
+- `massive-daily-grouped-transform`
+  - weekday 4:35 PM New York time for `close`
+  - Tue-Sat 4:35 AM New York time for `finalize`
+
+- `etf-parquet-update`
+  - weekday 4:40 PM New York time for `close`
+  - Tue-Sat 4:40 AM New York time for `finalize`
+
+## Dependencies
+
+Lambda dependencies are intentionally small.
+
+- `boto3` is available in Lambda runtime
+- `pyarrow` is required for transform/curation and scripts
+
+See:
+- `requirements/lambda.txt`
+- `requirements/scripts.txt`
+
+## Notes on stock support
+
+This repo keeps full-market data in raw + staging but does **not** add a full daily stock-curation lambda yet.
+That is intentional.
+
+Reason:
+- ETF per-symbol/year rewrite pattern is acceptable for ETF volume
+- The same pattern for 10k+ stocks would create much heavier S3 request and rewrite overhead
+
+If stock curation is added later, use a different storage layout than ETF per-symbol/year.
+
+## Git setup
+
+For the data repo:
+
+```bash
+git clone https://github.com/pochunhuang1107/US-Market-Data.git
+```
+
+For the renamed web app repo, update your existing local origin:
+
+```bash
+git remote -v
+git remote set-url origin https://github.com/pochunhuang1107/US-Market-Simulation-Platform.git
+git remote -v
+```
+
+GitHub may redirect the old repo URL for a while, but updating `origin` is cleaner.

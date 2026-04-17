@@ -1,0 +1,8 @@
+{
+  "BUCKET_NAME": "us-market-data-casper",
+  "STAGING_PREFIX": "staging/market_bars",
+  "CURATED_PREFIX": "curated/etf_daily_prices",
+  "REFERENCE_PREFIX": "curated/reference",
+  "ETF_SYMBOLS": "SPY,QQQ,DIA,IWM,VTI,XLF,XLK,XLE,XLV,XLY,XLP,XLI,XLU,XLB,XLRE,GLD,SLV,TLT,IEF,HYG,LQD,ARKK,VUG,VTV,QUAL,MTUM,IBIT",
+  "SNS_TOPIC_ARN": "arn:aws:sns:us-west-2:123456789012:us-market-data-alerts"
+}
