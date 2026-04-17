@@ -8,3 +8,4 @@ build/
 *.zip
 .DS_Store
 EOF
+*.egg-info/

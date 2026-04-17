@@ -12,26 +12,22 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from botocore.exceptions import ClientError
 
-from us_market_data.etf_metadata import (
-    load_metadata_table,
-    upsert_last_available_dates,
-    write_metadata_table,
-)
-from us_market_data.s3_paths import curated_key, etf_metadata_key, staging_key_for_month
-
 s3 = boto3.client("s3")
 sns = boto3.client("sns")
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
 STAGING_PREFIX = os.environ.get("STAGING_PREFIX", "staging/market_bars")
 CURATED_PREFIX = os.environ.get("CURATED_PREFIX", "curated/etf_daily_prices")
-REFERENCE_PREFIX = os.environ.get("REFERENCE_PREFIX", "curated/reference")
+METADATA_KEY = os.environ.get(
+    "ETF_METADATA_KEY",
+    "curated/reference/etf_symbol_metadata/data.parquet",
+)
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 ETF_SYMBOLS = {
     s.strip() for s in os.environ["ETF_SYMBOLS"].split(",") if s.strip()
 }
 
-SCHEMA = pa.schema(
+PRICE_SCHEMA = pa.schema(
     [
         pa.field("date", pa.string()),
         pa.field("year", pa.int32()),
@@ -44,6 +40,15 @@ SCHEMA = pa.schema(
         pa.field("volume", pa.float64()),
         pa.field("vwap", pa.float64()),
         pa.field("transactions", pa.float64()),
+    ]
+)
+
+METADATA_SCHEMA = pa.schema(
+    [
+        pa.field("symbol", pa.string()),
+        pa.field("first_available_date", pa.string()),
+        pa.field("last_available_date", pa.string()),
+        pa.field("updated_at", pa.string()),
     ]
 )
 
@@ -111,6 +116,15 @@ def is_market_holiday(date_str: str) -> bool:
     return date_str in holidays
 
 
+def staging_key_for_month(date_str: str) -> str:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"{STAGING_PREFIX}/year={dt.year}/month={dt.month:02d}/data.parquet"
+
+
+def curated_key(symbol: str, year: int) -> str:
+    return f"{CURATED_PREFIX}/symbol={symbol}/year={year}/data.parquet"
+
+
 def object_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
@@ -122,23 +136,38 @@ def object_exists(bucket: str, key: str) -> bool:
         raise
 
 
-def empty_table() -> pa.Table:
-    arrays = [pa.array([], type=field.type) for field in SCHEMA]
-    return pa.Table.from_arrays(arrays, schema=SCHEMA)
+def empty_price_table() -> pa.Table:
+    arrays = [pa.array([], type=field.type) for field in PRICE_SCHEMA]
+    return pa.Table.from_arrays(arrays, schema=PRICE_SCHEMA)
 
 
-def align_table_to_schema(table: pa.Table) -> pa.Table:
+def empty_metadata_table() -> pa.Table:
+    arrays = [pa.array([], type=field.type) for field in METADATA_SCHEMA]
+    return pa.Table.from_arrays(arrays, schema=METADATA_SCHEMA)
+
+
+def align_price_table_to_schema(table: pa.Table) -> pa.Table:
     arrays = []
-    for field in SCHEMA:
+    for field in PRICE_SCHEMA:
         if field.name in table.column_names:
             arrays.append(pc.cast(table[field.name], field.type))
         else:
             arrays.append(pa.array([None] * table.num_rows, type=field.type))
-    return pa.Table.from_arrays(arrays, schema=SCHEMA)
+    return pa.Table.from_arrays(arrays, schema=PRICE_SCHEMA)
+
+
+def align_metadata_table_to_schema(table: pa.Table) -> pa.Table:
+    arrays = []
+    for field in METADATA_SCHEMA:
+        if field.name in table.column_names:
+            arrays.append(pc.cast(table[field.name], field.type))
+        else:
+            arrays.append(pa.array([None] * table.num_rows, type=field.type))
+    return pa.Table.from_arrays(arrays, schema=METADATA_SCHEMA)
 
 
 def load_staging_month_table(date_str: str) -> pa.Table:
-    key = staging_key_for_month(STAGING_PREFIX, date_str)
+    key = staging_key_for_month(date_str)
 
     if not object_exists(BUCKET_NAME, key):
         raise FileNotFoundError(f"Missing staging parquet: s3://{BUCKET_NAME}/{key}")
@@ -146,7 +175,7 @@ def load_staging_month_table(date_str: str) -> pa.Table:
     response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
     body = response["Body"].read()
     table = pq.read_table(io.BytesIO(body))
-    return align_table_to_schema(table)
+    return align_price_table_to_schema(table)
 
 
 def filter_table_for_date(table: pa.Table, date_str: str) -> pa.Table:
@@ -166,15 +195,15 @@ def filter_table_for_etfs(table: pa.Table) -> pa.Table:
 
 
 def load_existing_curated_table(symbol: str, year: int) -> pa.Table:
-    key = curated_key(CURATED_PREFIX, symbol, year)
+    key = curated_key(symbol, year)
 
     if not object_exists(BUCKET_NAME, key):
-        return empty_table()
+        return empty_price_table()
 
     response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
     body = response["Body"].read()
     table = pq.read_table(io.BytesIO(body))
-    return align_table_to_schema(table)
+    return align_price_table_to_schema(table)
 
 
 def split_table_by_symbol_year(table: pa.Table) -> Dict[Tuple[str, int], pa.Table]:
@@ -203,7 +232,7 @@ def drop_target_date(table: pa.Table, date_str: str) -> pa.Table:
     return table.filter(mask)
 
 
-def dedupe_and_sort(table: pa.Table) -> pa.Table:
+def dedupe_and_sort_price_table(table: pa.Table) -> pa.Table:
     if table.num_rows == 0:
         return table
 
@@ -231,11 +260,11 @@ def dedupe_and_sort(table: pa.Table) -> pa.Table:
 def merge_curated_data(existing_table: pa.Table, new_table: pa.Table, date_str: str) -> pa.Table:
     existing_without_date = drop_target_date(existing_table, date_str)
     merged = pa.concat_tables([existing_without_date, new_table], promote_options="default")
-    return dedupe_and_sort(merged)
+    return dedupe_and_sort_price_table(merged)
 
 
 def write_curated_table(symbol: str, year: int, table: pa.Table) -> str:
-    key = curated_key(CURATED_PREFIX, symbol, year)
+    key = curated_key(symbol, year)
     out = io.BytesIO()
     pq.write_table(table, out, compression="snappy")
     out.seek(0)
@@ -249,16 +278,97 @@ def write_curated_table(symbol: str, year: int, table: pa.Table) -> str:
     return key
 
 
-def update_etf_metadata_for_symbols(symbols_touched: set[str], date_str: str) -> str:
-    metadata_key = etf_metadata_key(REFERENCE_PREFIX)
-    metadata_table = load_metadata_table(s3, BUCKET_NAME, metadata_key)
-    updated_table = upsert_last_available_dates(
-        metadata_table,
-        symbols=symbols_touched,
-        date_str=date_str,
-        updated_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+def load_metadata_table() -> pa.Table:
+    if not object_exists(BUCKET_NAME, METADATA_KEY):
+        return empty_metadata_table()
+
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=METADATA_KEY)
+    body = response["Body"].read()
+    table = pq.read_table(io.BytesIO(body))
+    return align_metadata_table_to_schema(table)
+
+
+def metadata_table_to_rows(table: pa.Table) -> Dict[str, Dict[str, str]]:
+    if table.num_rows == 0:
+        return {}
+
+    symbols = table["symbol"].to_pylist()
+    firsts = table["first_available_date"].to_pylist()
+    lasts = table["last_available_date"].to_pylist()
+    updateds = table["updated_at"].to_pylist()
+
+    rows: Dict[str, Dict[str, str]] = {}
+    for symbol, first_date, last_date, updated_at in zip(symbols, firsts, lasts, updateds):
+        rows[str(symbol)] = {
+            "symbol": str(symbol),
+            "first_available_date": str(first_date),
+            "last_available_date": str(last_date),
+            "updated_at": str(updated_at),
+        }
+    return rows
+
+
+def metadata_rows_to_table(rows: Dict[str, Dict[str, str]]) -> pa.Table:
+    if not rows:
+        return empty_metadata_table()
+
+    ordered_symbols = sorted(rows.keys())
+    return pa.Table.from_arrays(
+        [
+            pa.array([rows[s]["symbol"] for s in ordered_symbols], type=pa.string()),
+            pa.array([rows[s]["first_available_date"] for s in ordered_symbols], type=pa.string()),
+            pa.array([rows[s]["last_available_date"] for s in ordered_symbols], type=pa.string()),
+            pa.array([rows[s]["updated_at"] for s in ordered_symbols], type=pa.string()),
+        ],
+        schema=METADATA_SCHEMA,
     )
-    return write_metadata_table(s3, BUCKET_NAME, metadata_key, updated_table)
+
+
+def update_metadata_table(
+    metadata_table: pa.Table,
+    *,
+    touched_symbols: List[str],
+    date_str: str,
+) -> pa.Table:
+    rows = metadata_table_to_rows(metadata_table)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    for symbol in sorted(set(touched_symbols)):
+        existing = rows.get(symbol)
+        if existing is None:
+            rows[symbol] = {
+                "symbol": symbol,
+                "first_available_date": date_str,
+                "last_available_date": date_str,
+                "updated_at": now_utc,
+            }
+            continue
+
+        existing_first = existing["first_available_date"]
+        existing_last = existing["last_available_date"]
+
+        rows[symbol] = {
+            "symbol": symbol,
+            "first_available_date": min(existing_first, date_str),
+            "last_available_date": max(existing_last, date_str),
+            "updated_at": now_utc,
+        }
+
+    return metadata_rows_to_table(rows)
+
+
+def write_metadata_table(table: pa.Table) -> str:
+    out = io.BytesIO()
+    pq.write_table(table, out, compression="snappy")
+    out.seek(0)
+
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=METADATA_KEY,
+        Body=out.getvalue(),
+        ContentType="application/octet-stream",
+    )
+    return METADATA_KEY
 
 
 def lambda_handler(event, context):
@@ -304,7 +414,7 @@ def lambda_handler(event, context):
         if etf_table.num_rows == 0:
             msg = (
                 f"No ETF rows found in staging for {date_str} at "
-                f"s3://{BUCKET_NAME}/{staging_key_for_month(STAGING_PREFIX, date_str)}"
+                f"s3://{BUCKET_NAME}/{staging_key_for_month(date_str)}"
             )
             publish_sns("us-market-data curated empty", msg)
             return {
@@ -320,7 +430,6 @@ def lambda_handler(event, context):
 
         written_keys = []
         rows_written = 0
-        symbols_touched: set[str] = set()
 
         for (symbol, year), new_table in sorted(grouped.items()):
             existing_table = load_existing_curated_table(symbol, year)
@@ -328,9 +437,15 @@ def lambda_handler(event, context):
             key = write_curated_table(symbol, year, merged_table)
             written_keys.append(key)
             rows_written += new_table.num_rows
-            symbols_touched.add(symbol)
 
-        metadata_key = update_etf_metadata_for_symbols(symbols_touched, date_str)
+        touched_symbols = sorted(set(etf_table["symbol"].to_pylist()))
+        metadata_table = load_metadata_table()
+        updated_metadata_table = update_metadata_table(
+            metadata_table,
+            touched_symbols=touched_symbols,
+            date_str=date_str,
+        )
+        metadata_key = write_metadata_table(updated_metadata_table)
 
         return {
             "statusCode": 200,
@@ -342,6 +457,7 @@ def lambda_handler(event, context):
             "rows_written": rows_written,
             "sample_keys": written_keys[:10],
             "metadata_key": metadata_key,
+            "metadata_symbols_touched": len(touched_symbols),
             "status": "SUCCEEDED",
         }
 
