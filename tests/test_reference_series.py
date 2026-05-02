@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +13,12 @@ sys.path.insert(0, str(REPO_ROOT / "lambdas" / "reference_series_curated_update"
 import backfill_reference_series as reference_series  # noqa: E402
 import check_reference_series  # noqa: E402
 import lambda_function as reference_series_lambda  # noqa: E402
+
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 5, 1, 12, 0, 0, tzinfo=tz)
 
 
 class ReferenceSeriesTests(unittest.TestCase):
@@ -177,20 +183,63 @@ class ReferenceSeriesTests(unittest.TestCase):
             [("DGS10", 10), ("VIX", 2)],
         )
 
-    def test_lambda_default_event_resolution(self) -> None:
+    def test_lambda_resolve_target_date_uses_event_date(self) -> None:
+        self.assertEqual(
+            reference_series_lambda.resolve_target_date({"date": "2026-04-30"}),
+            "2026-04-30",
+        )
+
+    def test_lambda_resolve_target_date_close_uses_today(self) -> None:
+        with patch.object(reference_series_lambda, "datetime", FixedDateTime):
+            self.assertEqual(
+                reference_series_lambda.resolve_target_date({"mode": "close"}),
+                "2026-05-01",
+            )
+
+    def test_lambda_resolve_target_date_finalize_uses_yesterday(self) -> None:
+        with patch.object(reference_series_lambda, "datetime", FixedDateTime):
+            self.assertEqual(
+                reference_series_lambda.resolve_target_date({"mode": "finalize"}),
+                "2026-04-30",
+            )
+
+    def test_lambda_resolve_target_date_default_uses_yesterday(self) -> None:
+        with patch.object(reference_series_lambda, "datetime", FixedDateTime):
+            self.assertEqual(reference_series_lambda.resolve_target_date({}), "2026-04-30")
+
+    def test_lambda_default_event_resolution_is_single_date(self) -> None:
         with patch.object(
             reference_series_lambda,
-            "current_new_york_date",
-            return_value=date(2026, 4, 30),
+            "resolve_target_date",
+            return_value="2026-04-30",
         ):
             request = reference_series_lambda.resolve_update_request({}, {})
 
+        self.assertEqual(request.request_mode, "single_date")
+        self.assertEqual(request.target_date, date(2026, 4, 30))
         self.assertEqual(request.symbols, reference_series_lambda.DEFAULT_REFERENCE_SYMBOLS)
-        self.assertEqual(request.start_date, date(2026, 1, 1))
+        self.assertEqual(request.start_date, date(2026, 4, 30))
         self.assertEqual(request.end_date, date(2026, 4, 30))
         self.assertFalse(request.dry_run)
 
-    def test_lambda_event_overrides(self) -> None:
+    def test_lambda_event_date_overrides_target_date(self) -> None:
+        request = reference_series_lambda.resolve_update_request(
+            {
+                "symbols": ["vix", "DGS10"],
+                "date": "2026-04-30",
+                "dry_run": True,
+            },
+            {},
+        )
+
+        self.assertEqual(request.request_mode, "single_date")
+        self.assertEqual(request.target_date, date(2026, 4, 30))
+        self.assertEqual(request.symbols, ["VIX", "DGS10"])
+        self.assertEqual(request.start_date, date(2026, 4, 30))
+        self.assertEqual(request.end_date, date(2026, 4, 30))
+        self.assertTrue(request.dry_run)
+
+    def test_lambda_manual_range_event_overrides(self) -> None:
         request = reference_series_lambda.resolve_update_request(
             {
                 "symbols": ["vix", "DGS10"],
@@ -201,16 +250,46 @@ class ReferenceSeriesTests(unittest.TestCase):
             {},
         )
 
+        self.assertEqual(request.request_mode, "manual_range")
+        self.assertIsNone(request.target_date)
         self.assertEqual(request.symbols, ["VIX", "DGS10"])
         self.assertEqual(request.start_date, date(2026, 1, 1))
         self.assertEqual(request.end_date, date(2026, 4, 30))
         self.assertTrue(request.dry_run)
 
+    def test_lambda_start_date_without_end_date_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "end_date is required"):
+            reference_series_lambda.resolve_update_request(
+                {"start_date": "2026-01-01"},
+                {},
+            )
+
+    def test_lambda_end_date_without_start_date_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "start_date is required"):
+            reference_series_lambda.resolve_update_request(
+                {"end_date": "2026-01-31"},
+                {},
+            )
+
+    def test_lambda_lookback_days_does_not_create_range(self) -> None:
+        request = reference_series_lambda.resolve_update_request(
+            {
+                "symbols": ["VIX"],
+                "date": "2026-04-30",
+                "lookback_days": 5,
+            },
+            {},
+        )
+
+        self.assertEqual(request.request_mode, "single_date")
+        self.assertEqual(request.start_date, date(2026, 4, 30))
+        self.assertEqual(request.end_date, date(2026, 4, 30))
+
     def test_lambda_reference_symbols_environment_override(self) -> None:
         with patch.object(
             reference_series_lambda,
-            "current_new_york_date",
-            return_value=date(2026, 4, 30),
+            "resolve_target_date",
+            return_value="2026-04-30",
         ):
             request = reference_series_lambda.resolve_update_request(
                 {},
@@ -310,7 +389,7 @@ class ReferenceSeriesTests(unittest.TestCase):
             with patch.object(reference_series_lambda.shutil, "which", return_value=None):
                 with self.assertRaisesRegex(
                     RuntimeError,
-                    "failed fetching FRED symbol=DGS10 .*timeout_seconds=12",
+                    "failed fetching source=fred symbol=DGS10 .*timeout_seconds=12",
                 ) as raised:
                     reference_series_lambda.fetch_url(
                         "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
@@ -324,8 +403,43 @@ class ReferenceSeriesTests(unittest.TestCase):
         self.assertIn("curl fallback failed", message)
         self.assertIn("curl is not available for fallback provider fetch", message)
 
-    def test_lambda_fred_fetch_failure_includes_context(self) -> None:
-        class TimeoutResponse:
+    def test_lambda_fred_fetch_uses_curl_directly(self) -> None:
+        class CurlResult:
+            returncode = 0
+            stdout = b"observation_date,DGS10\n2026-01-02,4.1\n"
+            stderr = b""
+
+        with patch.object(
+            reference_series_lambda,
+            "urlopen",
+            side_effect=AssertionError("FRED should not use urlopen"),
+        ):
+            with patch.object(
+                reference_series_lambda.shutil,
+                "which",
+                return_value="/usr/bin/curl",
+            ):
+                with patch.object(
+                    reference_series_lambda.subprocess,
+                    "run",
+                    return_value=CurlResult(),
+                ) as run_mock:
+                    with patch("builtins.print") as print_mock:
+                        result = reference_series_lambda.fetch_fred_series(
+                            "DGS10",
+                            date(2026, 1, 1),
+                            date(2026, 1, 31),
+                        )
+
+        self.assertEqual(len(result.normalized_rows), 1)
+        self.assertEqual(result.normalized_rows[0]["value"], 4.1)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:5], ["/usr/bin/curl", "-fsSL", "--http1.1", "--max-time", "30"])
+        self.assertIn("id=DGS10", command[-1])
+        print_mock.assert_any_call("provider fetch used=curl source=fred symbol=DGS10")
+
+    def test_lambda_cboe_fetch_uses_urlopen_primary(self) -> None:
+        class UrlopenResponse:
             def __enter__(self):
                 return self
 
@@ -333,13 +447,36 @@ class ReferenceSeriesTests(unittest.TestCase):
                 return False
 
             def read(self):
-                raise TimeoutError("The read operation timed out")
+                return b"DATE,OPEN,HIGH,LOW,CLOSE\n2026-01-02,20,22,19,21\n"
 
         with patch.object(
             reference_series_lambda,
             "urlopen",
-            return_value=TimeoutResponse(),
+            return_value=UrlopenResponse(),
         ) as urlopen_mock:
+            with patch.object(
+                reference_series_lambda.subprocess,
+                "run",
+                side_effect=AssertionError("Cboe should not need curl on success"),
+            ):
+                with patch("builtins.print") as print_mock:
+                    result = reference_series_lambda.fetch_cboe_series(
+                        "VIX",
+                        date(2026, 1, 1),
+                        date(2026, 1, 31),
+                    )
+
+        self.assertEqual(len(result.normalized_rows), 1)
+        self.assertEqual(result.normalized_rows[0]["value"], 21.0)
+        self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 30.0)
+        print_mock.assert_any_call("provider fetch used=urlopen source=cboe symbol=VIX")
+
+    def test_lambda_fred_missing_curl_failure_includes_context(self) -> None:
+        with patch.object(
+            reference_series_lambda,
+            "urlopen",
+            side_effect=AssertionError("FRED should not use urlopen"),
+        ):
             with patch.dict(
                 "os.environ",
                 {"HTTP_TIMEOUT_SECONDS": "7"},
@@ -348,7 +485,7 @@ class ReferenceSeriesTests(unittest.TestCase):
                 with patch.object(reference_series_lambda.shutil, "which", return_value=None):
                     with self.assertRaisesRegex(
                         RuntimeError,
-                        "failed fetching FRED symbol=DGS10 .*timeout_seconds=7",
+                        "failed fetching source=fred symbol=DGS10 .*timeout_seconds=7",
                     ) as raised:
                         reference_series_lambda.fetch_fred_series(
                             "DGS10",
@@ -358,9 +495,7 @@ class ReferenceSeriesTests(unittest.TestCase):
 
         message = str(raised.exception)
         self.assertIn("url=https://fred.stlouisfed.org/graph/fredgraph.csv?", message)
-        self.assertIn("The read operation timed out", message)
-        self.assertIn("curl is not available for fallback provider fetch", message)
-        self.assertEqual(urlopen_mock.call_args.kwargs["timeout"], 7.0)
+        self.assertIn("curl is required for FRED provider fetch but is not available", message)
 
     def test_lambda_merge_curated_rows_preserves_outside_window_and_overwrites_dates(self) -> None:
         existing = [
@@ -424,6 +559,158 @@ class ReferenceSeriesTests(unittest.TestCase):
         )
         self.assertEqual(merged[-1]["close"], 31.0)
 
+    def test_lambda_weekend_skip_in_single_date_mode(self) -> None:
+        with patch.object(
+            reference_series_lambda,
+            "fetch_reference_series",
+            side_effect=AssertionError("no fetch"),
+        ):
+            with patch.dict(
+                "os.environ",
+                {"BUCKET_NAME": "unit-test-bucket"},
+                clear=True,
+            ):
+                result = reference_series_lambda.lambda_handler(
+                    {
+                        "symbols": ["VIX"],
+                        "date": "2026-05-02",
+                        "dry_run": True,
+                    },
+                    None,
+                )
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["status"], "SKIPPED")
+        self.assertEqual(result["request_mode"], "single_date")
+        self.assertEqual(result["target_date"], "2026-05-02")
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "weekend")
+        self.assertEqual(result["symbols_requested"], ["VIX"])
+        self.assertEqual(result["symbols_updated"], [])
+        self.assertEqual(result["rows_fetched"], 0)
+
+    def test_lambda_holiday_skip_in_single_date_mode(self) -> None:
+        with patch.object(
+            reference_series_lambda,
+            "fetch_reference_series",
+            side_effect=AssertionError("no fetch"),
+        ):
+            with patch.object(
+                reference_series_lambda,
+                "load_holidays_from_s3",
+                return_value={"2026-01-01"},
+            ):
+                with patch.dict(
+                    "os.environ",
+                    {"BUCKET_NAME": "unit-test-bucket"},
+                    clear=True,
+                ):
+                    result = reference_series_lambda.lambda_handler(
+                        {
+                            "symbols": ["DGS10"],
+                            "date": "2026-01-01",
+                            "dry_run": True,
+                        },
+                        None,
+                    )
+
+        self.assertEqual(result["status"], "SKIPPED")
+        self.assertEqual(result["reason"], "market_holiday")
+        self.assertEqual(result["target_date"], "2026-01-01")
+
+    def test_lambda_manual_range_does_not_skip_weekends_or_holidays(self) -> None:
+        rows = [
+            {
+                "date": "2026-01-02",
+                "symbol": "DGS10",
+                "source": "fred",
+                "series_type": "treasury_yield",
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": 4.1,
+                "value": 4.1,
+                "unit": "percent",
+            }
+        ]
+
+        def fake_fetch(symbol: str, start_date: date, end_date: date):
+            return reference_series_lambda.SeriesFetchResult(
+                symbol=symbol,
+                source="fred",
+                url="https://example.test/dgs10.csv",
+                normalized_rows=rows,
+            )
+
+        with patch.object(
+            reference_series_lambda,
+            "fetch_reference_series",
+            side_effect=fake_fetch,
+        ):
+            with patch.object(
+                reference_series_lambda,
+                "is_weekend",
+                side_effect=AssertionError("manual range should not check weekend"),
+            ):
+                with patch.object(
+                    reference_series_lambda,
+                    "is_market_holiday",
+                    side_effect=AssertionError("manual range should not check holiday"),
+                ):
+                    with patch.dict(
+                        "os.environ",
+                        {"BUCKET_NAME": "unit-test-bucket"},
+                        clear=True,
+                    ):
+                        result = reference_series_lambda.lambda_handler(
+                            {
+                                "symbols": ["DGS10"],
+                                "start_date": "2026-01-01",
+                                "end_date": "2026-01-04",
+                                "dry_run": True,
+                            },
+                            None,
+                        )
+
+        self.assertEqual(result["status"], "DRY_RUN")
+        self.assertEqual(result["request_mode"], "manual_range")
+        self.assertIsNone(result["target_date"])
+        self.assertFalse(result["skipped"])
+        self.assertEqual(result["symbols_updated"], ["DGS10"])
+
+    def test_lambda_single_date_no_provider_rows_raises(self) -> None:
+        def fake_fetch(symbol: str, start_date: date, end_date: date):
+            return reference_series_lambda.SeriesFetchResult(
+                symbol=symbol,
+                source="cboe",
+                url="https://example.test/vix.csv",
+                normalized_rows=[],
+            )
+
+        with patch.object(
+            reference_series_lambda,
+            "fetch_reference_series",
+            side_effect=fake_fetch,
+        ):
+            with patch.object(reference_series_lambda, "is_market_holiday", return_value=False):
+                with patch.object(reference_series_lambda, "publish_failure") as publish_mock:
+                    with patch.dict(
+                        "os.environ",
+                        {"BUCKET_NAME": "unit-test-bucket"},
+                        clear=True,
+                    ):
+                        with self.assertRaisesRegex(ValueError, "No provider rows returned"):
+                            reference_series_lambda.lambda_handler(
+                                {
+                                    "symbols": ["VIX"],
+                                    "date": "2026-04-30",
+                                    "dry_run": True,
+                                },
+                                None,
+                            )
+
+        publish_mock.assert_called_once()
+
     def test_lambda_dry_run_does_not_touch_s3(self) -> None:
         rows = [
             {
@@ -475,6 +762,9 @@ class ReferenceSeriesTests(unittest.TestCase):
 
         self.assertEqual(result["statusCode"], 200)
         self.assertEqual(result["status"], "DRY_RUN")
+        self.assertEqual(result["request_mode"], "manual_range")
+        self.assertIsNone(result["target_date"])
+        self.assertFalse(result["skipped"])
         self.assertEqual(result["symbols_updated"], ["VIX"])
         self.assertEqual(result["rows_fetched"], 1)
         self.assertEqual(result["rows_written"], 0)

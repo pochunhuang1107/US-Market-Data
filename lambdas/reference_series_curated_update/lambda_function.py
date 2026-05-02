@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import RemoteDisconnected
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
@@ -110,6 +110,8 @@ class UpdateRequest:
     symbols: list[str]
     start_date: date
     end_date: date
+    request_mode: str
+    target_date: date | None
     dry_run: bool
 
 
@@ -123,6 +125,22 @@ def get_sns_client():
 
 def current_new_york_date() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
+
+
+def resolve_target_date(event: Any) -> str:
+    if isinstance(event, dict) and event.get("date"):
+        return event["date"]
+
+    mode = event.get("mode") if isinstance(event, dict) else None
+    ny_now = datetime.now(ZoneInfo("America/New_York")).date()
+
+    if mode == "close":
+        return ny_now.isoformat()
+
+    if mode == "finalize":
+        return (ny_now - timedelta(days=1)).isoformat()
+
+    return (ny_now - timedelta(days=1)).isoformat()
 
 
 def parse_iso_date(value: str) -> date:
@@ -193,16 +211,23 @@ def resolve_update_request(event: Any, environ: dict[str, str] | None = None) ->
         symbol_value = environ.get("REFERENCE_SYMBOLS", ",".join(DEFAULT_REFERENCE_SYMBOLS))
     symbols = parse_symbols(symbol_value)
 
-    end_date = (
-        parse_iso_date(event["end_date"])
-        if event.get("end_date")
-        else current_new_york_date()
-    )
-    start_date = (
-        parse_iso_date(event["start_date"])
-        if event.get("start_date")
-        else date(end_date.year, 1, 1)
-    )
+    has_start_date = bool(event.get("start_date"))
+    has_end_date = bool(event.get("end_date"))
+    if has_start_date or has_end_date:
+        if not has_start_date:
+            raise ValueError("start_date is required when end_date is provided")
+        if not has_end_date:
+            raise ValueError("end_date is required when start_date is provided")
+        start_date = parse_iso_date(event["start_date"])
+        end_date = parse_iso_date(event["end_date"])
+        request_mode = "manual_range"
+        target_date = None
+    else:
+        target_date = parse_iso_date(resolve_target_date(event))
+        start_date = target_date
+        end_date = target_date
+        request_mode = "single_date"
+
     if start_date > end_date:
         raise ValueError("start_date must be on or before end_date")
 
@@ -210,6 +235,8 @@ def resolve_update_request(event: Any, environ: dict[str, str] | None = None) ->
         symbols=symbols,
         start_date=start_date,
         end_date=end_date,
+        request_mode=request_mode,
+        target_date=target_date,
         dry_run=parse_bool(event.get("dry_run"), default=False),
     )
 
@@ -234,6 +261,47 @@ def curated_key(symbol: str, year: int, curated_prefix: str = DEFAULT_CURATED_PR
 def metadata_key(environ: dict[str, str] | None = None) -> str:
     environ = os.environ if environ is None else environ
     return environ.get("METADATA_KEY", DEFAULT_METADATA_KEY)
+
+
+def is_weekend(date_str: str) -> bool:
+    dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return dt.weekday() >= 5
+
+
+def load_holidays_from_s3(year: int) -> set[str]:
+    bucket_name = os.environ.get("BUCKET_NAME")
+    if not bucket_name:
+        raise ValueError("BUCKET_NAME environment variable is required")
+    key = f"raw/reference/market_holidays/year={year}/holidays.json"
+
+    try:
+        response = get_s3_client().get_object(Bucket=bucket_name, Key=key)
+        body = response["Body"].read().decode("utf-8")
+        payload = json.loads(body)
+
+        holidays = set()
+        for item in payload.get("results", []):
+            holiday_date = item.get("date")
+            if holiday_date:
+                holidays.add(holiday_date)
+        return holidays
+
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"NoSuchKey", "404", "NotFound"}:
+            print(f"Holiday file not found for year {year}, skipping holiday check")
+            return set()
+        raise
+
+    except Exception as exc:
+        print(f"Could not load holiday file for year {year}: {exc}")
+        return set()
+
+
+def is_market_holiday(date_str: str) -> bool:
+    year = datetime.strptime(date_str, "%Y-%m-%d").year
+    holidays = load_holidays_from_s3(year)
+    return date_str in holidays
 
 
 def parse_observation_date(value: object) -> str | None:
@@ -404,10 +472,11 @@ def fetch_url_with_curl(
     source: str | None = None,
     symbol: str | None = None,
     timeout_seconds: float,
+    unavailable_message: str = "curl is not available for fallback provider fetch",
 ) -> bytes:
     curl_path = shutil.which("curl")
     if curl_path is None:
-        raise RuntimeError("curl is not available for fallback provider fetch")
+        raise RuntimeError(unavailable_message)
 
     result = subprocess.run(
         [
@@ -437,7 +506,7 @@ def provider_fetch_error_message(
 ) -> str:
     context = []
     if source:
-        context.append(str(source).upper())
+        context.append(f"source={str(source).lower()}")
     if symbol:
         context.append(f"symbol={symbol.upper()}")
     context.append(f"url={url}")
@@ -455,6 +524,7 @@ def format_timeout_seconds(timeout_seconds: float) -> str:
 def fetch_cboe_series(symbol: str, start_date: date, end_date: date) -> SeriesFetchResult:
     symbol = symbol.upper()
     url = CBOE_CSV_URLS[symbol]
+    print(f"provider fetch used=urlopen source=cboe symbol={symbol}")
     rows = normalize_cboe_rows(
         csv_rows(fetch_url(url, source="cboe", symbol=symbol)),
         symbol,
@@ -470,8 +540,22 @@ def fetch_fred_series(symbol: str, start_date: date, end_date: date) -> SeriesFe
         f"{FRED_CSV_URL}?"
         f"{urlencode({'id': symbol, 'cosd': start_date.isoformat(), 'coed': end_date.isoformat()})}"
     )
+    timeout_seconds = resolve_http_timeout_seconds()
+    print(f"provider fetch used=curl source=fred symbol={symbol}")
+    try:
+        raw_bytes = fetch_url_with_curl(
+            url,
+            source="fred",
+            symbol=symbol,
+            timeout_seconds=timeout_seconds,
+            unavailable_message="curl is required for FRED provider fetch but is not available",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            provider_fetch_error_message("fred", symbol, url, timeout_seconds, exc)
+        ) from exc
     rows = normalize_fred_rows(
-        csv_rows(fetch_url(url, source="fred", symbol=symbol)),
+        csv_rows(raw_bytes),
         symbol,
         start_date,
         end_date,
@@ -701,6 +785,15 @@ def update_reference_series(
         rows_fetched += len(rows)
 
         if not rows:
+            if request.request_mode == "single_date":
+                target_date = (
+                    request.target_date.isoformat()
+                    if request.target_date
+                    else request.start_date.isoformat()
+                )
+                raise ValueError(
+                    f"No provider rows returned for symbol={symbol} target_date={target_date}"
+                )
             skipped_symbols.append(symbol)
             symbol_statuses[symbol] = "no_new_rows"
             print(f"skip symbol={symbol}: no provider rows in requested date range")
@@ -756,6 +849,8 @@ def update_reference_series(
     return {
         "statusCode": 200,
         "status": status,
+        "request_mode": request.request_mode,
+        "target_date": request.target_date.isoformat() if request.target_date else None,
         "symbols_requested": request.symbols,
         "symbols_updated": symbols_updated,
         "skipped_symbols": skipped_symbols,
@@ -767,6 +862,38 @@ def update_reference_series(
         "dry_run": request.dry_run,
         "start_date": request.start_date.isoformat(),
         "end_date": request.end_date.isoformat(),
+        "skipped": False,
+    }
+
+
+def skipped_single_date_response(
+    request: UpdateRequest,
+    config: LambdaConfig,
+    reason: str,
+) -> dict[str, Any]:
+    target_date = (
+        request.target_date.isoformat()
+        if request.target_date
+        else request.start_date.isoformat()
+    )
+    return {
+        "statusCode": 200,
+        "status": "SKIPPED",
+        "request_mode": request.request_mode,
+        "target_date": target_date,
+        "start_date": request.start_date.isoformat(),
+        "end_date": request.end_date.isoformat(),
+        "skipped": True,
+        "reason": reason,
+        "symbols_requested": request.symbols,
+        "symbols_updated": [],
+        "skipped_symbols": request.symbols,
+        "symbol_statuses": {symbol: reason for symbol in request.symbols},
+        "rows_fetched": 0,
+        "rows_written": 0,
+        "updated_keys": [],
+        "metadata_key": config.metadata_key,
+        "dry_run": request.dry_run,
     }
 
 
@@ -775,6 +902,16 @@ def lambda_handler(event, context):
     try:
         config = resolve_config()
         request = resolve_update_request(event)
+        if request.request_mode == "single_date":
+            target_date = (
+                request.target_date.isoformat()
+                if request.target_date
+                else request.start_date.isoformat()
+            )
+            if is_weekend(target_date):
+                return skipped_single_date_response(request, config, "weekend")
+            if is_market_holiday(target_date):
+                return skipped_single_date_response(request, config, "market_holiday")
         return update_reference_series(event, config, request)
     except Exception as exc:
         publish_failure(config, event, exc)
