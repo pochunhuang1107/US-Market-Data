@@ -17,7 +17,7 @@ from backfill_reference_series import PROVIDER_BY_SYMBOL  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check reference-series staging parquet in S3")
+    parser = argparse.ArgumentParser(description="Check curated reference-series parquet in S3")
     parser.add_argument("--symbols", required=True, help="Comma-separated symbols")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--region", default="us-west-2")
@@ -33,8 +33,8 @@ def parse_symbols(value: str) -> list[str]:
     return symbols
 
 
-def staging_prefix(source: str, symbol: str) -> str:
-    return f"staging/reference_series/source={source}/symbol={symbol.upper()}/"
+def curated_prefix(symbol: str) -> str:
+    return f"curated/reference_series/symbol={symbol.upper()}/"
 
 
 def list_parquet_keys(s3_client, bucket: str, prefix: str) -> list[str]:
@@ -118,7 +118,7 @@ def main() -> int:
     )
     for symbol in symbols:
         source = PROVIDER_BY_SYMBOL[symbol]
-        prefix = staging_prefix(source, symbol)
+        prefix = curated_prefix(symbol)
         keys = list_parquet_keys(s3_client, args.bucket, prefix)
         tables = [read_s3_parquet(s3_client, args.bucket, key) for key in keys]
         print_summary(summarize_table(symbol, source, concat_tables(tables)))
