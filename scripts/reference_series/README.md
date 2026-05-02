@@ -163,6 +163,17 @@ curated/reference/reference_series_metadata/data.parquet
 No `raw/reference_series` or `staging/reference_series` layer is used by reference-series
 automation. Simulation Platform should consume `curated/reference_series` only.
 
+Reference-series scheduled Lambda behavior mirrors the existing Massive ingestion Lambda:
+
+- Scheduled EventBridge events resolve one target date.
+- `event.date` overrides the target date.
+- `mode="close"` uses today in `America/New_York`.
+- `mode="finalize"` and the default mode use yesterday in `America/New_York`.
+- `start_date`/`end_date` are only for manual repair/backfill.
+- There is no `lookback_days` behavior.
+- There is no `raw/reference_series` layer.
+- There is no `staging/reference_series` layer.
+
 Use one Lambda codebase with two provider-specific EventBridge schedules. This avoids mixing
 providers with different publication timing while keeping deployment and operations simple.
 
@@ -174,7 +185,8 @@ Cboe volatility event:
 
 ```json
 {
-  "symbols": ["VIX", "VIX9D", "VXEEM"]
+  "symbols": ["VIX", "VIX9D", "VXEEM"],
+  "mode": "finalize"
 }
 ```
 
@@ -185,7 +197,8 @@ FRED/H.15 rates event:
 
 ```json
 {
-  "symbols": ["DGS10", "DGS2", "T10Y2Y", "DFF"]
+  "symbols": ["DGS10", "DGS2", "T10Y2Y", "DFF"],
+  "mode": "close"
 }
 ```
 
@@ -193,21 +206,32 @@ The Lambda uses a single bounded HTTP request per provider fetch. It does not sl
 in-Lambda retry/backoff; provider/API failures should fail the scheduled job visibly and publish SNS
 when `SNS_TOPIC_ARN` is configured.
 
-Default Lambda behavior for an empty event:
+Scheduled/default Lambda behavior:
 
 - Symbols come from `REFERENCE_SYMBOLS`, or from the active default set when the variable is absent.
-- `end_date` is the current New York date.
-- `start_date` is January 1 of the `end_date` year.
+- `start_date` and `end_date` are both set to the resolved target date.
+- Weekend and market-holiday target dates are skipped before provider fetches.
+- If a target trading date returns no provider rows, the Lambda fails visibly and publishes SNS when
+  `SNS_TOPIC_ARN` is configured.
 - `dry_run` is `false`.
 
-Example event override:
+Explicit scheduled target-date override:
 
 ```json
 {
-  "symbols": ["VIX", "DGS10"],
-  "start_date": "2026-01-01",
-  "end_date": "2026-04-30",
+  "symbols": ["VIX"],
+  "date": "2026-04-30",
   "dry_run": true
+}
+```
+
+Manual repair/backfill event:
+
+```json
+{
+  "symbols": ["DGS10"],
+  "start_date": "2026-04-01",
+  "end_date": "2026-04-30"
 }
 ```
 
