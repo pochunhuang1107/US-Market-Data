@@ -1,12 +1,31 @@
 # Reference Series MVP
 
-Reference series are market regime inputs that are useful beside ETF daily prices, but are not tradeable ETF price history. This folder keeps them as a data-only S3 staging path for later research and app work.
+Reference series are market regime inputs that are useful beside ETF daily prices, but are not
+tradeable ETF price history. This folder keeps the data-only reference-series curation scripts and
+documentation.
 
-This branch does not enable VIX rules, strategy conditions, backend APIs, frontend UI, builder behavior, or simulation-engine logic. It writes no `curated/reference_series` output.
+The app-ready source of truth is:
 
-This MVP writes normalized monthly Parquet to `staging/reference_series/` only. Raw provider snapshots are intentionally not written here to avoid unnecessary S3 objects and cost. The existing Massive raw/staging design is different because Massive provides daily market-wide snapshots by date; Cboe and FRED reference-series data is fetched as historical/date-range CSV per symbol.
+- `curated/reference_series`: app-ready yearly reference-series data.
+
+Future Simulation Platform integration should read only from `curated/reference_series`, not from
+`staging/reference_series`. Curated is the stable runtime contract.
+
+`staging/reference_series` is not part of the active reference-series workflow. Future scheduled
+reference-series automation can fetch Cboe/FRED data, normalize it, merge it directly into
+`curated/reference_series` yearly files, and update metadata without writing staging first.
+
+The Massive pipeline still needs raw/staging layers because Massive provides daily market-wide
+snapshots. Reference series from Cboe and FRED are small, clean, symbol-level historical/date-range
+series, so raw snapshots and a staging layer are not necessary here.
+
+This branch does not enable VIX rules, strategy conditions, backend APIs, frontend UI, builder
+behavior, simulation-engine logic, Lambda, or EventBridge automation. Raw provider snapshots are
+intentionally not written for this MVP to avoid unnecessary S3 objects and cost.
 
 ## Supported Symbols
+
+Current active supported symbols:
 
 | Symbol | Source | Type | Unit |
 | --- | --- | --- | --- |
@@ -18,7 +37,7 @@ This MVP writes normalized monthly Parquet to `staging/reference_series/` only. 
 | `T10Y2Y` | FRED | yield spread | percent |
 | `DFF` | FRED | policy rate | percent |
 
-Future candidates pending source confirmation:
+Future candidates pending source confirmation remain unsupported by the scripts:
 
 - `VVIX`
 - `OVX`
@@ -32,8 +51,6 @@ Cboe CSVs use the official historical-data CSV endpoint pattern:
 https://cdn.cboe.com/api/global/us_indices/daily_prices/<SYMBOL>_History.csv
 ```
 
-This was checked for the active Phase 1 Cboe symbols when the MVP was added. Cboe exposes these files from its historical VIX and volatility-index pages, but the exact CDN path is still centralized in `CBOE_CSV_URLS` so it can be updated in one place if Cboe changes its site.
-
 FRED data uses the no-key graph CSV download:
 
 ```text
@@ -44,7 +61,7 @@ No FRED API key is required for the current implementation.
 
 ## Normalized Schema
 
-All staging parquet files use exactly these columns:
+Curated reference-series parquet files use exactly these columns:
 
 ```text
 date
@@ -65,37 +82,34 @@ Rules:
 - `symbol` is uppercase.
 - `source` is `cboe` or `fred`.
 - `open`, `high`, `low`, `close`, and `value` are nullable numeric fields.
-- Rows with missing dates or missing values are dropped.
+- Rows with missing dates or missing values are dropped during normalization.
 - Rows are sorted ascending by date.
-- Duplicate dates are de-duplicated, keeping the latest row seen from the provider file.
+- Duplicate dates are de-duplicated, keeping the latest row seen.
 
-For Cboe rows, `value` equals `close`. For FRED rows, `open`, `high`, and `low` are null, while `close` and `value` both equal the observation value.
+For Cboe rows, `value` equals `close`. For FRED rows, `open`, `high`, and `low` are null, while
+`close` and `value` both equal the observation value.
 
 ## S3 Layout
 
-Staging parquet is the only MVP output:
+App-ready curated parquet:
 
 ```text
-staging/reference_series/source=<source>/symbol=<symbol>/year=<YYYY>/month=<MM>/data.parquet
+curated/reference_series/symbol=<symbol>/year=<YYYY>/data.parquet
 ```
 
-Each staging object contains one symbol, one source, and one calendar month. Parquet files are written with Snappy compression.
+Curated metadata:
 
-## Backfill Examples
-
-Dry-run fetch and normalization:
-
-```bash
-python scripts/reference_series/backfill_reference_series.py \
-  --symbols VIX,DGS10 \
-  --start-date 2010-01-01 \
-  --end-date 2026-04-30 \
-  --bucket us-market-data-casper \
-  --region us-west-2 \
-  --dry-run
+```text
+curated/reference/reference_series_metadata/data.parquet
 ```
 
-Write monthly staging parquet:
+The metadata file includes `symbol`, `source`, `series_type`, `first_available_date`,
+`last_available_date`, `row_count`, and `updated_at`. Parquet files are written with Snappy
+compression.
+
+## Example Commands
+
+Backfill dry-run:
 
 ```bash
 python scripts/reference_series/backfill_reference_series.py \
@@ -104,14 +118,22 @@ python scripts/reference_series/backfill_reference_series.py \
   --end-date 2026-04-30 \
   --bucket us-market-data-casper \
   --region us-west-2 \
-  --write-staging
+  --dry-run
 ```
 
-Existing staging objects are skipped unless `--overwrite` is supplied.
+Write curated:
 
-## Validation
+```bash
+python scripts/reference_series/backfill_reference_series.py \
+  --symbols VIX,VIX9D,VXEEM,DGS10,DGS2,T10Y2Y,DFF \
+  --start-date 2010-01-01 \
+  --end-date 2026-04-30 \
+  --bucket us-market-data-casper \
+  --region us-west-2 \
+  --overwrite
+```
 
-After writing staging data, print row counts, date ranges, and value ranges:
+Validate curated:
 
 ```bash
 python scripts/reference_series/check_reference_series.py \
@@ -120,12 +142,8 @@ python scripts/reference_series/check_reference_series.py \
   --region us-west-2
 ```
 
-The checker lists objects under:
-
-```text
-staging/reference_series/source=<source>/symbol=<symbol>/year=*/month=*/data.parquet
-```
-
 ## Athena
 
-Athena can query this layout if an external table is added later, but Athena is optional and is not required by app runtime behavior. This branch only creates data-ingestion scripts and documentation.
+Athena can query these layouts if external tables are added later, but Athena is optional and is not
+required by app runtime behavior. This branch only creates manual curation scripts and
+documentation; Lambda/EventBridge automation is intentionally out of scope here.

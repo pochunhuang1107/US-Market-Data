@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from http.client import RemoteDisconnected
 from typing import Iterable
 from urllib.error import HTTPError, URLError
@@ -81,13 +81,12 @@ class SeriesFetchResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Backfill reference-series data to S3")
+    parser = argparse.ArgumentParser(description="Backfill reference-series data to curated S3")
     parser.add_argument("--symbols", required=True, help="Comma-separated symbols")
     parser.add_argument("--start-date", required=True, help="Inclusive YYYY-MM-DD")
     parser.add_argument("--end-date", required=True, help="Inclusive YYYY-MM-DD")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--region", default="us-west-2")
-    parser.add_argument("--write-staging", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -308,11 +307,25 @@ def fetch_reference_series(symbol: str, start_date: date, end_date: date) -> Ser
     raise ValueError(f"unsupported provider {provider!r} for {symbol}")
 
 
-def staging_key(source: str, symbol: str, year: int, month: int) -> str:
-    return (
-        f"staging/reference_series/source={source}/symbol={symbol.upper()}/"
-        f"year={year}/month={month:02d}/data.parquet"
-    )
+METADATA_SCHEMA = pa.schema(
+    [
+        pa.field("symbol", pa.string()),
+        pa.field("source", pa.string()),
+        pa.field("series_type", pa.string()),
+        pa.field("first_available_date", pa.string()),
+        pa.field("last_available_date", pa.string()),
+        pa.field("row_count", pa.int64()),
+        pa.field("updated_at", pa.string()),
+    ]
+)
+
+
+def curated_key(symbol: str, year: int) -> str:
+    return f"curated/reference_series/symbol={symbol.upper()}/year={year}/data.parquet"
+
+
+def metadata_key() -> str:
+    return "curated/reference/reference_series_metadata/data.parquet"
 
 
 def object_exists(s3_client, bucket: str, key: str) -> bool:
@@ -334,17 +347,64 @@ def rows_to_table(rows: list[dict[str, object]]) -> pa.Table:
     return pa.Table.from_arrays(arrays, schema=NORMALIZED_SCHEMA)
 
 
-def group_rows_by_month(
-    rows: Iterable[dict[str, object]],
-) -> dict[tuple[int, int], list[dict[str, object]]]:
-    grouped: dict[tuple[int, int], list[dict[str, object]]] = defaultdict(list)
+def metadata_rows_to_table(rows: list[dict[str, object]]) -> pa.Table:
+    arrays = []
+    for field in METADATA_SCHEMA:
+        values = [row.get(field.name) for row in rows]
+        arrays.append(pa.array(values, type=field.type))
+    return pa.Table.from_arrays(arrays, schema=METADATA_SCHEMA)
+
+
+def align_metadata_table(table: pa.Table) -> pa.Table:
+    arrays = []
+    for field in METADATA_SCHEMA:
+        if field.name in table.column_names:
+            arrays.append(table[field.name].cast(field.type))
+        else:
+            arrays.append(pa.array([None] * table.num_rows, type=field.type))
+    return pa.Table.from_arrays(arrays, schema=METADATA_SCHEMA)
+
+
+def table_to_metadata_rows(table: pa.Table) -> list[dict[str, object]]:
+    table = align_metadata_table(table)
+    columns = {name: table[name].to_pylist() for name in METADATA_SCHEMA.names}
+    return [
+        {name: columns[name][idx] for name in METADATA_SCHEMA.names}
+        for idx in range(table.num_rows)
+    ]
+
+
+def sort_dedupe_rows(rows: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    by_date: dict[str, dict[str, object]] = {}
+    for row in rows:
+        date_str = row.get("date")
+        if not isinstance(date_str, str):
+            continue
+        by_date[date_str] = {column: row.get(column) for column in NORMALIZED_COLUMNS}
+    return [by_date[date_str] for date_str in sorted(by_date)]
+
+
+def group_rows_by_year(rows: Iterable[dict[str, object]]) -> dict[int, list[dict[str, object]]]:
+    grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
     for row in rows:
         row_date = parse_iso_date(str(row["date"]))
-        grouped[(row_date.year, row_date.month)].append(row)
+        grouped[row_date.year].append(row)
     return dict(grouped)
 
 
-def write_staging(
+def write_table(s3_client, bucket: str, key: str, table: pa.Table) -> None:
+    out = io.BytesIO()
+    pq.write_table(table, out, compression="snappy")
+    out.seek(0)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=out.getvalue(),
+        ContentType="application/octet-stream",
+    )
+
+
+def write_curated(
     s3_client,
     bucket: str,
     result: SeriesFetchResult,
@@ -352,26 +412,78 @@ def write_staging(
     overwrite: bool,
 ) -> list[str]:
     keys = []
-    for (year, month), rows in sorted(group_rows_by_month(result.normalized_rows).items()):
-        key = staging_key(result.source, result.symbol, year, month)
+    rows_by_year = group_rows_by_year(sort_dedupe_rows(result.normalized_rows))
+    for year, rows in sorted(rows_by_year.items()):
+        key = curated_key(result.symbol, year)
         keys.append(key)
         if dry_run:
-            print(f"dry-run staging: s3://{bucket}/{key} rows={len(rows)}")
+            print(f"dry-run curated: s3://{bucket}/{key} rows={len(rows)}")
             continue
         if not overwrite and object_exists(s3_client, bucket, key):
-            print(f"skip existing staging: s3://{bucket}/{key} rows={len(rows)}")
+            print(f"skip existing curated: s3://{bucket}/{key} rows={len(rows)}")
             continue
-        out = io.BytesIO()
-        pq.write_table(rows_to_table(rows), out, compression="snappy")
-        out.seek(0)
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=out.getvalue(),
-            ContentType="application/octet-stream",
-        )
-        print(f"wrote staging: s3://{bucket}/{key} rows={len(rows)}")
+        write_table(s3_client, bucket, key, rows_to_table(rows))
+        print(f"wrote curated: s3://{bucket}/{key} rows={len(rows)}")
     return keys
+
+
+def metadata_row_for_result(result: SeriesFetchResult, updated_at: str) -> dict[str, object] | None:
+    rows = sort_dedupe_rows(result.normalized_rows)
+    if not rows:
+        return None
+    dates = [str(row["date"]) for row in rows]
+    series_types = [row.get("series_type") for row in rows if row.get("series_type")]
+    return {
+        "symbol": result.symbol,
+        "source": result.source,
+        "series_type": str(series_types[-1]) if series_types else None,
+        "first_available_date": min(dates),
+        "last_available_date": max(dates),
+        "row_count": len(rows),
+        "updated_at": updated_at,
+    }
+
+
+def load_existing_metadata_rows(s3_client, bucket: str) -> list[dict[str, object]]:
+    key = metadata_key()
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return []
+        raise
+    return table_to_metadata_rows(pq.read_table(io.BytesIO(response["Body"].read())))
+
+
+def merge_metadata_rows(
+    existing_rows: list[dict[str, object]],
+    updated_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    updated_by_symbol = {str(row["symbol"]).upper(): row for row in updated_rows}
+    merged = [
+        row
+        for row in existing_rows
+        if str(row.get("symbol", "")).upper() not in updated_by_symbol
+    ]
+    merged.extend(updated_by_symbol[symbol] for symbol in sorted(updated_by_symbol))
+    return sorted(merged, key=lambda row: str(row.get("symbol", "")))
+
+
+def update_metadata(
+    s3_client,
+    bucket: str,
+    metadata_rows: list[dict[str, object]],
+    dry_run: bool,
+) -> None:
+    key = metadata_key()
+    if dry_run:
+        print(f"dry-run metadata: s3://{bucket}/{key} rows={len(metadata_rows)}")
+        return
+    existing_rows = load_existing_metadata_rows(s3_client, bucket)
+    merged_rows = merge_metadata_rows(existing_rows, metadata_rows)
+    write_table(s3_client, bucket, key, metadata_rows_to_table(merged_rows))
+    print(f"wrote metadata: s3://{bucket}/{key} rows={len(merged_rows)}")
 
 
 def print_fetch_summary(result: SeriesFetchResult) -> None:
@@ -399,17 +511,12 @@ def main() -> int:
         print("--start-date must be on or before --end-date", file=sys.stderr)
         return 2
 
-    should_write = args.write_staging
-    dry_run = args.dry_run or not should_write
-    if not args.write_staging:
-        print("No --write-staging flag provided; fetching and printing dry-run write plan only.")
-
-    s3_client = None
-    if should_write and not dry_run:
-        s3_client = boto3.client("s3", region_name=args.region)
+    s3_client = boto3.client("s3", region_name=args.region)
 
     total_rows = 0
-    total_staging_files = 0
+    total_curated_files = 0
+    metadata_rows = []
+    updated_at = datetime.now(timezone.utc).isoformat()
 
     for symbol in symbols:
         try:
@@ -419,21 +526,25 @@ def main() -> int:
             return 1
         print_fetch_summary(result)
         total_rows += len(result.normalized_rows)
+        keys = write_curated(
+            s3_client,
+            args.bucket,
+            result,
+            dry_run=args.dry_run,
+            overwrite=args.overwrite,
+        )
+        total_curated_files += len(keys)
+        metadata_row = metadata_row_for_result(result, updated_at)
+        if metadata_row is not None:
+            metadata_rows.append(metadata_row)
 
-        if args.write_staging or dry_run:
-            keys = write_staging(
-                s3_client,
-                args.bucket,
-                result,
-                dry_run=dry_run,
-                overwrite=args.overwrite,
-            )
-            total_staging_files += len(keys)
+    if metadata_rows:
+        update_metadata(s3_client, args.bucket, metadata_rows, dry_run=args.dry_run)
 
-    mode = "dry-run" if dry_run else "write"
+    mode = "dry-run" if args.dry_run else "write"
     print(
         f"reference-series backfill complete: mode={mode}, "
-        f"symbols={len(symbols)}, rows={total_rows}, staging_files={total_staging_files}"
+        f"symbols={len(symbols)}, rows={total_rows}, curated_files={total_curated_files}"
     )
     return 0
 
