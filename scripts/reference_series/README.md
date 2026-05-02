@@ -20,8 +20,8 @@ snapshots. Reference series from Cboe and FRED are small, clean, symbol-level hi
 series, so raw snapshots and a staging layer are not necessary here.
 
 This branch does not enable VIX rules, strategy conditions, backend APIs, frontend UI, builder
-behavior, simulation-engine logic, Lambda, or EventBridge automation. Raw provider snapshots are
-intentionally not written for this MVP to avoid unnecessary S3 objects and cost.
+behavior, or simulation-engine logic. Raw provider snapshots are intentionally not written to avoid
+unnecessary S3 objects and cost.
 
 ## Supported Symbols
 
@@ -109,6 +109,8 @@ compression.
 
 ## Example Commands
 
+Manual backfill remains available for initial loads, repairs, and historical restatements.
+
 Backfill dry-run:
 
 ```bash
@@ -142,8 +144,90 @@ python scripts/reference_series/check_reference_series.py \
   --region us-west-2
 ```
 
+## Lambda/EventBridge Automation
+
+The Lambda at `lambdas/reference_series_curated_update/lambda_function.py` is the scheduled update
+path for reference series. It fetches active Cboe/FRED series, normalizes rows to the curated
+schema, and merges directly into yearly curated parquet files:
+
+```text
+curated/reference_series/symbol=<SYMBOL>/year=<YYYY>/data.parquet
+```
+
+It also updates:
+
+```text
+curated/reference/reference_series_metadata/data.parquet
+```
+
+No `raw/reference_series` or `staging/reference_series` layer is used by reference-series
+automation. Simulation Platform should consume `curated/reference_series` only.
+
+Use one Lambda codebase with two provider-specific EventBridge schedules. This avoids mixing
+providers with different publication timing while keeping deployment and operations simple.
+
+Cboe volatility event:
+
+- Symbols: `VIX,VIX9D,VXEEM`
+- Suggested schedule: next trading morning around 10:00 AM ET, because Cboe free historical CSV
+  timing is less explicit.
+
+```json
+{
+  "symbols": ["VIX", "VIX9D", "VXEEM"]
+}
+```
+
+FRED/H.15 rates event:
+
+- Symbols: `DGS10,DGS2,T10Y2Y,DFF`
+- Suggested schedule: after 5:00 PM ET on weekdays, because H.15 is released around 4:15 PM ET.
+
+```json
+{
+  "symbols": ["DGS10", "DGS2", "T10Y2Y", "DFF"]
+}
+```
+
+The Lambda uses a single bounded HTTP request per provider fetch. It does not sleep or perform
+in-Lambda retry/backoff; provider/API failures should fail the scheduled job visibly and publish SNS
+when `SNS_TOPIC_ARN` is configured.
+
+Default Lambda behavior for an empty event:
+
+- Symbols come from `REFERENCE_SYMBOLS`, or from the active default set when the variable is absent.
+- `end_date` is the current New York date.
+- `start_date` is January 1 of the `end_date` year.
+- `dry_run` is `false`.
+
+Example event override:
+
+```json
+{
+  "symbols": ["VIX", "DGS10"],
+  "start_date": "2026-01-01",
+  "end_date": "2026-04-30",
+  "dry_run": true
+}
+```
+
+Environment variables:
+
+| Variable | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `BUCKET_NAME` | yes | none | S3 bucket containing curated market data. |
+| `REFERENCE_SYMBOLS` | no | active symbol list | Comma-separated active symbols. |
+| `SNS_TOPIC_ARN` | no | none | Publishes failure notifications when set. |
+| `CURATED_PREFIX` | no | `curated/reference_series` | Curated yearly parquet prefix. |
+| `METADATA_KEY` | no | curated metadata key | Curated metadata object key. |
+| `HTTP_TIMEOUT_SECONDS` | no | `30` | Positive number for each bounded HTTP request. |
+
+For each symbol/year, the Lambda loads the existing curated parquet file if present, combines it
+with newly fetched provider rows for that year, sorts by date ascending, de-duplicates by date while
+keeping the latest provider row, and writes Snappy-compressed parquet back to the same key. Existing
+curated rows outside the update window are preserved.
+
 ## Athena
 
 Athena can query these layouts if external tables are added later, but Athena is optional and is not
-required by app runtime behavior. This branch only creates manual curation scripts and
-documentation; Lambda/EventBridge automation is intentionally out of scope here.
+required by app runtime behavior.
