@@ -57,6 +57,7 @@ config/
   etf_symbols.example.txt
   lambda_env_examples/
 docs/
+  APEWISDOM_LAMBDA_DEPLOYMENT.md
   DATA_CONTRACT.md
 ```
 
@@ -147,6 +148,9 @@ Package each lambda with:
 ```
 
 Artifacts will be created under `dist/`.
+
+For the ApeWisdom Lambda AWS Console setup, see `docs/APEWISDOM_LAMBDA_DEPLOYMENT.md`.
+Use `config/lambda_env_examples/apewisdom_reddit_trends_ingest.env.example` as the environment variable reference.
 
 ## Lambda schedules
 
