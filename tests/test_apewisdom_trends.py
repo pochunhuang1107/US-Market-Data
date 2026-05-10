@@ -8,10 +8,9 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import ingest_apewisdom_trends as apewisdom  # noqa: E402
+from us_market_data import apewisdom  # noqa: E402
 from us_market_data.s3_paths import raw_apewisdom_key, staging_reddit_trends_key  # noqa: E402
 
 

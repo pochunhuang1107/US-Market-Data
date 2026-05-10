@@ -39,6 +39,7 @@ lambdas/
   massive_daily_grouped_ingest/
   massive_daily_grouped_transform/
   etf_parquet_update/
+  apewisdom_reddit_trends_ingest/
 scripts/
   backfill_curated_etf_from_staging.py
   bootstrap_etf_symbol_metadata.py
@@ -48,6 +49,7 @@ scripts/
 src/us_market_data/
   s3_paths.py
   etf_metadata.py
+  apewisdom.py
 requirements/
   lambda.txt
   scripts.txt
@@ -141,6 +143,7 @@ Package each lambda with:
 ./scripts/package_lambda.sh massive_daily_grouped_ingest
 ./scripts/package_lambda.sh massive_daily_grouped_transform
 ./scripts/package_lambda.sh etf_parquet_update
+./scripts/package_lambda.sh apewisdom_reddit_trends_ingest
 ```
 
 Artifacts will be created under `dist/`.
@@ -160,6 +163,10 @@ Recommended mapping from your current schedule:
 - `etf-parquet-update`
   - weekday 4:40 PM New York time for `close`
   - Tue-Sat 4:40 AM New York time for `finalize`
+
+- `apewisdom-reddit-trends-ingest`
+  - suggested future EventBridge cadence: hourly or every few hours in UTC
+  - not deployed or scheduled by this repo change
 
 ## Dependencies
 
