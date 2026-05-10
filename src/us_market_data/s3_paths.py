@@ -16,3 +16,16 @@ def curated_key(curated_prefix: str, symbol: str, year: int) -> str:
 
 def etf_metadata_key(reference_prefix: str) -> str:
     return f"{reference_prefix}/etf_symbol_metadata/data.parquet"
+
+
+def raw_apewisdom_key(
+    raw_prefix: str,
+    date_str: str,
+    hour_str: str,
+    filter_name: str,
+) -> str:
+    return f"{raw_prefix}/date={date_str}/hour={hour_str}/filter={filter_name}/data.json"
+
+
+def staging_reddit_trends_key(staging_prefix: str, date_str: str) -> str:
+    return f"{staging_prefix}/date={date_str}/data.parquet"

@@ -5,19 +5,23 @@
 ### Raw
 Path:
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
+- `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 
 Purpose:
 - preserve source payloads for replay and debugging
+- preserve ApeWisdom Reddit/social trend payloads as attention-signal source data
 
 ### Staging
 Path:
 - `staging/market_bars/year=YYYY/month=MM/data.parquet`
+- `staging/reddit_trends/date=YYYY-MM-DD/data.parquet`
 
 Purpose:
 - full-market monthly parquet
 - stable transform layer before curated outputs
+- stable Reddit/social trends table for downstream feature jobs
 
-Schema:
+Market bars schema:
 - `date`
 - `year`
 - `month`
@@ -29,6 +33,25 @@ Schema:
 - `volume`
 - `vwap`
 - `transactions`
+
+Reddit trends schema:
+- `date`
+- `hour`
+- `source`
+- `filter`
+- `page`
+- `rank`
+- `ticker`
+- `name`
+- `mentions`
+- `upvotes`
+- `rank_24h_ago`
+- `mentions_24h_ago`
+- `mention_change_pct`
+- `ingested_at`
+
+Note:
+- ApeWisdom data is an attention signal, not a buy/sell signal.
 
 ### Curated ETF Prices
 Path:
@@ -66,6 +89,7 @@ The app should not assume:
 - staging is stable for end-user requests
 - stock-curated data exists
 - raw payloads are directly queryable by the product
+- Reddit trend rows are investment recommendations or sentiment scores
 
 ## Idempotency rules
 
@@ -73,6 +97,8 @@ The app should not assume:
 - transform may overwrite the same monthly staging parquet
 - ETF curation may rewrite the same symbol/year parquet repeatedly
 - metadata parquet may be overwritten on each ETF curation run
+- ApeWisdom raw files may be overwritten for the same date/hour/filter
+- ApeWisdom staging parquet may be overwritten for the same date
 
 ## Close vs finalize
 

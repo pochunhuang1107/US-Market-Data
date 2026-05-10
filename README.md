@@ -15,6 +15,7 @@ Current scope:
 - Full-market staging transform
 - ETF-only curation to app-facing parquet
 - ETF symbol metadata parquet for app lookup
+- Reddit/social trend ingestion from ApeWisdom as an attention signal
 - Manual/backfill scripts for curation and metadata bootstrap
 
 Deferred on purpose:
@@ -25,7 +26,9 @@ Deferred on purpose:
 ## Current S3 layout
 
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
+- `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 - `staging/market_bars/year=YYYY/month=MM/data.parquet`
+- `staging/reddit_trends/date=YYYY-MM-DD/data.parquet`
 - `curated/etf_daily_prices/symbol=SYMBOL/year=YYYY/data.parquet`
 - `curated/reference/etf_symbol_metadata/data.parquet`
 
@@ -39,6 +42,7 @@ lambdas/
 scripts/
   backfill_curated_etf_from_staging.py
   bootstrap_etf_symbol_metadata.py
+  ingest_apewisdom_trends.py
   validate_etf_symbol_metadata.py
   package_lambda.sh
 src/us_market_data/
@@ -107,7 +111,29 @@ python scripts/validate_etf_symbol_metadata.py \
   --metadata-key curated/reference/etf_symbol_metadata/data.parquet
 ```
 
-### 4. Deploy lambdas
+### 4. Manually ingest ApeWisdom Reddit trends
+
+Fetch the current ApeWisdom `all-stocks` page, write the raw payload, and write a normalized
+daily staging parquet file:
+
+```bash
+python scripts/ingest_apewisdom_trends.py \
+  --bucket us-market-data-casper \
+  --filter all-stocks
+```
+
+For local testing without S3, mirror the S3 layout under a local directory:
+
+```bash
+python scripts/ingest_apewisdom_trends.py \
+  --filter all-stocks \
+  --local-output-dir data/local_apewisdom
+```
+
+ApeWisdom tracks stock/crypto mentions across Reddit and 4chan boards. Treat this data as an
+attention signal, not a buy/sell signal.
+
+### 5. Deploy lambdas
 
 Package each lambda with:
 
