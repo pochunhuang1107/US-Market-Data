@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import json
 import sys
+from email.message import Message
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
 import pyarrow.parquet as pq
@@ -17,6 +20,45 @@ from us_market_data.s3_paths import (  # noqa: E402
     curated_ticker_reference_key,
     raw_ticker_reference_key,
 )
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self.body
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def http_error(
+    code: int,
+    url: str = "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+    headers: dict[str, str] | None = None,
+) -> HTTPError:
+    message = Message()
+    for key, value in (headers or {}).items():
+        message[key] = value
+    return HTTPError(url, code, "error", message, None)
+
+
+def queued_opener(actions: list[dict[str, object] | Exception]) -> tuple[Any, list[str]]:
+    urls: list[str] = []
+
+    def opener(request: object, timeout: int = 30) -> FakeResponse:
+        del timeout
+        urls.append(request.full_url)  # type: ignore[attr-defined]
+        action = actions.pop(0)
+        if isinstance(action, Exception):
+            raise action
+        return FakeResponse(action)
+
+    return opener, urls
 
 
 def sample_payload() -> dict[str, object]:
@@ -112,6 +154,135 @@ def test_pagination_helper_handles_next_url_and_adds_api_key() -> None:
     assert first_query["apiKey"] == ["secret"]
     assert second_query["cursor"] == ["abc"]
     assert second_query["apiKey"] == ["secret"]
+
+
+def test_fetch_massive_ticker_page_retries_429_then_succeeds() -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener([http_error(429), {"status": "OK", "results": []}])
+
+    payload = ticker_reference.fetch_massive_ticker_page(
+        "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    assert payload["status"] == "OK"
+    assert len(urls) == 2
+    assert sleeps == [2.0]
+
+
+def test_fetch_massive_ticker_page_respects_retry_after_header() -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener(
+        [http_error(429, headers={"Retry-After": "7"}), {"status": "OK", "results": []}]
+    )
+
+    ticker_reference.fetch_massive_ticker_page(
+        "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    assert len(urls) == 2
+    assert sleeps == [7.0]
+
+
+def test_fetch_massive_ticker_page_retries_500_then_succeeds() -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener([http_error(500), {"status": "OK", "results": []}])
+
+    payload = ticker_reference.fetch_massive_ticker_page(
+        "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+        opener=opener,
+        base_sleep_seconds=3.0,
+        sleeper=sleeps.append,
+    )
+
+    assert payload["status"] == "OK"
+    assert len(urls) == 2
+    assert sleeps == [3.0]
+
+
+def test_fetch_massive_ticker_page_retries_urlerror_then_succeeds() -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener([URLError("temporary failure"), {"status": "OK", "results": []}])
+
+    payload = ticker_reference.fetch_massive_ticker_page(
+        "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    assert payload["status"] == "OK"
+    assert len(urls) == 2
+    assert sleeps == [2.0]
+
+
+def test_fetch_massive_ticker_page_fails_clearly_after_max_retries() -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener([http_error(503), http_error(503), http_error(503)])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ticker_reference.fetch_massive_ticker_page(
+            "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+            opener=opener,
+            max_retries=2,
+            base_sleep_seconds=1.0,
+            sleeper=sleeps.append,
+        )
+
+    message = str(exc_info.value)
+    assert "HTTP 503" in message
+    assert "after 3 attempts" in message
+    assert "secret" not in message
+    assert "<redacted>" in message
+    assert len(urls) == 3
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_fetch_massive_ticker_page_does_not_retry_auth_errors(status_code: int) -> None:
+    sleeps: list[float] = []
+    opener, urls = queued_opener([http_error(status_code)])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ticker_reference.fetch_massive_ticker_page(
+            "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+            opener=opener,
+            sleeper=sleeps.append,
+        )
+
+    assert f"HTTP {status_code}" in str(exc_info.value)
+    assert "secret" not in str(exc_info.value)
+    assert len(urls) == 1
+    assert sleeps == []
+
+
+def test_fetch_massive_ticker_pages_passes_retry_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_fetch_page(url: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"url": url, **kwargs})
+        return {"results": []}
+
+    monkeypatch.setattr(ticker_reference, "fetch_massive_ticker_page", fake_fetch_page)
+
+    def sleeper(seconds: float) -> None:
+        del seconds
+
+    pages = ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        max_retries=8,
+        base_sleep_seconds=5.0,
+        max_sleep_seconds=90.0,
+        sleeper=sleeper,
+    )
+
+    assert pages == [{"results": []}]
+    assert calls[0]["max_retries"] == 8
+    assert calls[0]["base_sleep_seconds"] == 5.0
+    assert calls[0]["max_sleep_seconds"] == 90.0
+    assert calls[0]["sleeper"] is sleeper
 
 
 def test_common_stock_classification_defaults_to_cs_only() -> None:

@@ -158,6 +158,10 @@ MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_reference.py \
   --local-output-dir data/local_ticker_reference
 ```
 
+Massive reference ingestion retries rate limits and temporary server/network failures with
+configurable `--max-retries`, `--base-sleep-seconds`, and `--max-sleep-seconds` options. If Massive
+continues to rate limit the run, rerun it later or increase the retry/backoff values.
+
 The curated output includes a conservative `is_common_stock_candidate` flag. In v1, the default
 candidate logic is active US stock-market tickers with Massive type `CS`.
 

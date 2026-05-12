@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 from collections.abc import Callable, Container, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ import pyarrow.parquet as pq
 MASSIVE_TICKERS_URL = "https://api.massive.com/v3/reference/tickers"
 SOURCE = "massive"
 DEFAULT_COMMON_STOCK_TYPE_CODES = frozenset({"CS"})
+RETRYABLE_MASSIVE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 
 NORMALIZED_COLUMNS = [
     "symbol",
@@ -79,7 +81,7 @@ def utc_timestamp(now: datetime | None = None) -> str:
 
 
 def resolve_massive_api_key(env: Mapping[str, str] | None = None) -> str:
-    source_env = env or os.environ
+    source_env = os.environ if env is None else env
     api_key = source_env.get("MASSIVE_API_KEY") or source_env.get("POLYGON_API_KEY")
     if api_key and api_key.strip():
         return api_key.strip()
@@ -117,14 +119,45 @@ def sanitize_api_key_from_url(url: str) -> str:
         (key, "<redacted>" if key.lower() == "apikey" else value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
     ]
-    return urlunparse(parsed._replace(query=urlencode(query)))
+    sanitized_url = urlunparse(parsed._replace(query=urlencode(query)))
+    return sanitized_url.replace("%3Credacted%3E", "<redacted>")
+
+
+def retry_after_seconds(exc: HTTPError) -> float | None:
+    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+    if retry_after is None:
+        return None
+    try:
+        seconds = float(str(retry_after).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def exponential_backoff_seconds(
+    retry_index: int,
+    base_sleep_seconds: float,
+    max_sleep_seconds: float,
+) -> float:
+    return min(max_sleep_seconds, base_sleep_seconds * (2**retry_index))
 
 
 def fetch_massive_ticker_page(
     url: str,
     opener: Callable[..., Any] = urlopen,
     timeout: int = 30,
+    max_retries: int = 5,
+    base_sleep_seconds: float = 2.0,
+    max_sleep_seconds: float = 60.0,
+    sleeper: Callable[[float], Any] = time.sleep,
 ) -> dict[str, Any]:
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
+    if base_sleep_seconds < 0:
+        raise ValueError("base_sleep_seconds must be >= 0")
+    if max_sleep_seconds < 0:
+        raise ValueError("max_sleep_seconds must be >= 0")
+
     request = Request(
         url,
         method="GET",
@@ -135,16 +168,36 @@ def fetch_massive_ticker_page(
     )
     safe_url = sanitize_api_key_from_url(url)
 
-    try:
-        with opener(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except HTTPError as exc:
-        message = f"HTTP {exc.code} fetching Massive ticker reference URL {safe_url}"
-        raise RuntimeError(message) from exc
-    except URLError as exc:
-        raise RuntimeError(
-            f"failed fetching Massive ticker reference URL {safe_url}: {exc.reason}"
-        ) from exc
+    for retry_index in range(max_retries + 1):
+        try:
+            with opener(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            break
+        except HTTPError as exc:
+            message = f"HTTP {exc.code} fetching Massive ticker reference URL {safe_url}"
+            if exc.code not in RETRYABLE_MASSIVE_HTTP_CODES:
+                raise RuntimeError(message) from exc
+            if retry_index >= max_retries:
+                raise RuntimeError(f"{message} after {retry_index + 1} attempts") from exc
+            sleep_seconds = retry_after_seconds(exc)
+            if sleep_seconds is None:
+                sleep_seconds = exponential_backoff_seconds(
+                    retry_index,
+                    base_sleep_seconds,
+                    max_sleep_seconds,
+                )
+            sleeper(sleep_seconds)
+        except URLError as exc:
+            message = f"failed fetching Massive ticker reference URL {safe_url}: {exc.reason}"
+            if retry_index >= max_retries:
+                raise RuntimeError(f"{message} after {retry_index + 1} attempts") from exc
+            sleeper(
+                exponential_backoff_seconds(
+                    retry_index,
+                    base_sleep_seconds,
+                    max_sleep_seconds,
+                )
+            )
 
     try:
         payload = json.loads(body)
@@ -163,11 +216,25 @@ def fetch_massive_ticker_pages(
     locale: str = "us",
     limit: int = 1000,
     page_fetcher: Callable[[str], dict[str, Any]] | None = None,
+    max_retries: int = 5,
+    base_sleep_seconds: float = 2.0,
+    max_sleep_seconds: float = 60.0,
+    sleeper: Callable[[float], Any] = time.sleep,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be >= 1")
 
-    fetcher = page_fetcher or fetch_massive_ticker_page
+    def fetcher(fetch_url: str) -> dict[str, Any]:
+        if page_fetcher:
+            return page_fetcher(fetch_url)
+        return fetch_massive_ticker_page(
+            fetch_url,
+            max_retries=max_retries,
+            base_sleep_seconds=base_sleep_seconds,
+            max_sleep_seconds=max_sleep_seconds,
+            sleeper=sleeper,
+        )
+
     url = build_tickers_url(
         api_key=api_key,
         market=market,
