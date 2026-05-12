@@ -41,6 +41,7 @@ Deferred on purpose:
 lambdas/
   massive_daily_grouped_ingest/
   massive_daily_grouped_transform/
+  massive_ticker_reference_ingest/
   etf_parquet_update/
   apewisdom_reddit_trends_ingest/
 scripts/
@@ -66,6 +67,7 @@ config/
 docs/
   APEWISDOM_LAMBDA_DEPLOYMENT.md
   DATA_CONTRACT.md
+  MASSIVE_TICKER_REFERENCE_LAMBDA_DEPLOYMENT.md
 ```
 
 ## Metadata design
@@ -197,6 +199,7 @@ Package each lambda with:
 ```bash
 ./scripts/package_lambda.sh massive_daily_grouped_ingest
 ./scripts/package_lambda.sh massive_daily_grouped_transform
+./scripts/package_lambda.sh massive_ticker_reference_ingest
 ./scripts/package_lambda.sh etf_parquet_update
 ./scripts/package_lambda.sh apewisdom_reddit_trends_ingest
 ```
@@ -205,6 +208,8 @@ Artifacts will be created under `dist/`.
 
 For the ApeWisdom Lambda AWS Console setup, see `docs/APEWISDOM_LAMBDA_DEPLOYMENT.md`.
 Use `config/lambda_env_examples/apewisdom_reddit_trends_ingest.env.example` as the environment variable reference.
+
+For the Massive ticker reference Lambda AWS Console setup, see `docs/MASSIVE_TICKER_REFERENCE_LAMBDA_DEPLOYMENT.md`.
 
 ## Lambda schedules
 
@@ -221,6 +226,10 @@ Recommended mapping from your current schedule:
 - `etf-parquet-update`
   - weekday 4:40 PM New York time for `close`
   - Tue-Sat 4:40 AM New York time for `finalize`
+
+- `massive-ticker-reference-ingest`
+  - suggested future EventBridge cadence: weekly Saturday morning after Friday market data is finalized
+  - not deployed or scheduled by this repo change
 
 - `apewisdom-reddit-trends-ingest`
   - suggested future EventBridge cadence: hourly or every few hours in UTC
