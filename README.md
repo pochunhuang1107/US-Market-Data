@@ -15,6 +15,7 @@ Current scope:
 - Full-market staging transform
 - ETF-only curation to app-facing parquet
 - ETF symbol metadata parquet for app lookup
+- Massive ticker reference ingestion for common-stock filtering metadata
 - Reddit/social trend ingestion from ApeWisdom as an attention signal
 - Manual/backfill scripts for curation and metadata bootstrap
 
@@ -26,11 +27,13 @@ Deferred on purpose:
 ## Current S3 layout
 
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
+- `raw/reference/massive_tickers/date=YYYY-MM-DD/page=N/data.json`
 - `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 - `staging/market_bars/year=YYYY/month=MM/data.parquet`
 - `staging/reddit_trends/date=YYYY-MM-DD/data.parquet`
 - `curated/etf_daily_prices/symbol=SYMBOL/year=YYYY/data.parquet`
 - `curated/reference/etf_symbol_metadata/data.parquet`
+- `curated/reference/ticker_reference/data.parquet`
 
 ## Repo structure
 
@@ -44,12 +47,14 @@ scripts/
   backfill_curated_etf_from_staging.py
   bootstrap_etf_symbol_metadata.py
   ingest_apewisdom_trends.py
+  ingest_massive_ticker_reference.py
   validate_etf_symbol_metadata.py
   package_lambda.sh
 src/us_market_data/
   s3_paths.py
   etf_metadata.py
   apewisdom.py
+  ticker_reference.py
 requirements/
   lambda.txt
   scripts.txt
@@ -136,7 +141,27 @@ python scripts/ingest_apewisdom_trends.py \
 ApeWisdom tracks stock/crypto mentions across Reddit and 4chan boards. Treat this data as an
 attention signal, not a buy/sell signal.
 
-### 5. Deploy lambdas
+### 5. Manually ingest Massive ticker reference
+
+Fetch active US stock-market ticker reference metadata from Massive, write each raw response page,
+and write a normalized curated parquet dataset:
+
+```bash
+MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_reference.py \
+  --bucket us-market-data-casper
+```
+
+For local testing without S3, mirror the S3 layout under a local directory:
+
+```bash
+MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_reference.py \
+  --local-output-dir data/local_ticker_reference
+```
+
+The curated output includes a conservative `is_common_stock_candidate` flag. In v1, the default
+candidate logic is active US stock-market tickers with Massive type `CS`.
+
+### 6. Deploy lambdas
 
 Package each lambda with:
 

@@ -29,3 +29,14 @@ def raw_apewisdom_key(
 
 def staging_reddit_trends_key(staging_prefix: str, date_str: str) -> str:
     return f"{staging_prefix}/date={date_str}/data.parquet"
+
+
+def raw_ticker_reference_key(raw_prefix: str, date_str: str, page: int) -> str:
+    return f"{raw_prefix}/date={date_str}/page={page}/data.json"
+
+
+def curated_ticker_reference_key(reference_prefix_or_key: str) -> str:
+    value = reference_prefix_or_key.strip("/")
+    if value.endswith(".parquet"):
+        return value
+    return f"{value}/ticker_reference/data.parquet"

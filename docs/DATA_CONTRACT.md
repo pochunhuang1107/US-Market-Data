@@ -5,10 +5,12 @@
 ### Raw
 Path:
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
+- `raw/reference/massive_tickers/date=YYYY-MM-DD/page=N/data.json`
 - `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 
 Purpose:
 - preserve source payloads for replay and debugging
+- preserve Massive ticker reference pages for replay and type-classification audits
 - preserve ApeWisdom Reddit/social trend payloads as attention-signal source data
 
 ### Staging
@@ -67,22 +69,45 @@ Schema:
 ### Curated Reference Metadata
 Path:
 - `curated/reference/etf_symbol_metadata/data.parquet`
+- `curated/reference/ticker_reference/data.parquet`
 
 Purpose:
 - cheap app lookup for symbol coverage window
 - avoid request-time history scans against curated ETF parquet
+- normalized Massive ticker metadata for downstream universe filtering
 
-Schema:
+ETF metadata schema:
 - `symbol` (string)
 - `first_available_date` (string, ISO date)
 - `last_available_date` (string, ISO date)
 - `updated_at` (string, ISO timestamp UTC)
+
+Ticker reference schema:
+- `symbol` (string)
+- `name` (string)
+- `market` (string)
+- `locale` (string)
+- `type` (string)
+- `active` (boolean)
+- `currency_name` (string)
+- `primary_exchange` (string)
+- `cik` (string)
+- `composite_figi` (string)
+- `share_class_figi` (string)
+- `last_updated_utc` (string)
+- `ingested_at` (string, ISO timestamp UTC)
+- `source` (string)
+- `is_common_stock_candidate` (boolean)
+
+Ticker reference v1 note:
+- `is_common_stock_candidate` is conservative and defaults to active US stock-market tickers with Massive type `CS`.
 
 ## App assumptions
 
 The app may assume:
 - ETF backtests use `curated/etf_daily_prices`
 - symbol coverage defaults use `curated/reference/etf_symbol_metadata/data.parquet`
+- ticker universe filtering may use `curated/reference/ticker_reference/data.parquet`
 - unsupported symbols should be rejected before simulation
 
 The app should not assume:
@@ -99,6 +124,8 @@ The app should not assume:
 - metadata parquet may be overwritten on each ETF curation run
 - ApeWisdom raw files may be overwritten for the same date/hour/filter
 - ApeWisdom staging parquet may be overwritten for the same date
+- Massive ticker reference raw files may be overwritten for the same date/page
+- Massive ticker reference curated parquet may be overwritten on each manual ingestion
 
 ## Close vs finalize
 
