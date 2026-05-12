@@ -150,6 +150,8 @@ def fetch_massive_ticker_page(
     base_sleep_seconds: float = 2.0,
     max_sleep_seconds: float = 60.0,
     sleeper: Callable[[float], Any] = time.sleep,
+    progress_callback: Callable[[str], Any] | None = None,
+    page_number: int | None = None,
 ) -> dict[str, Any]:
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
@@ -167,6 +169,7 @@ def fetch_massive_ticker_page(
         },
     )
     safe_url = sanitize_api_key_from_url(url)
+    page_label = f"page {page_number}" if page_number is not None else "page"
 
     for retry_index in range(max_retries + 1):
         try:
@@ -186,18 +189,29 @@ def fetch_massive_ticker_page(
                     base_sleep_seconds,
                     max_sleep_seconds,
                 )
+            if progress_callback:
+                progress_callback(
+                    f"HTTP {exc.code} fetching {page_label}. "
+                    f"Sleeping {sleep_seconds:.1f} seconds before retry "
+                    f"{retry_index + 1}/{max_retries}..."
+                )
             sleeper(sleep_seconds)
         except URLError as exc:
             message = f"failed fetching Massive ticker reference URL {safe_url}: {exc.reason}"
             if retry_index >= max_retries:
                 raise RuntimeError(f"{message} after {retry_index + 1} attempts") from exc
-            sleeper(
-                exponential_backoff_seconds(
-                    retry_index,
-                    base_sleep_seconds,
-                    max_sleep_seconds,
-                )
+            sleep_seconds = exponential_backoff_seconds(
+                retry_index,
+                base_sleep_seconds,
+                max_sleep_seconds,
             )
+            if progress_callback:
+                progress_callback(
+                    f"Error fetching {page_label}: {exc.reason}. "
+                    f"Sleeping {sleep_seconds:.1f} seconds before retry "
+                    f"{retry_index + 1}/{max_retries}..."
+                )
+            sleeper(sleep_seconds)
 
     try:
         payload = json.loads(body)
@@ -220,11 +234,12 @@ def fetch_massive_ticker_pages(
     base_sleep_seconds: float = 2.0,
     max_sleep_seconds: float = 60.0,
     sleeper: Callable[[float], Any] = time.sleep,
+    progress_callback: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be >= 1")
 
-    def fetcher(fetch_url: str) -> dict[str, Any]:
+    def fetcher(fetch_url: str, page_number: int) -> dict[str, Any]:
         if page_fetcher:
             return page_fetcher(fetch_url)
         return fetch_massive_ticker_page(
@@ -233,6 +248,8 @@ def fetch_massive_ticker_pages(
             base_sleep_seconds=base_sleep_seconds,
             max_sleep_seconds=max_sleep_seconds,
             sleeper=sleeper,
+            progress_callback=progress_callback,
+            page_number=page_number,
         )
 
     url = build_tickers_url(
@@ -245,19 +262,29 @@ def fetch_massive_ticker_pages(
     pages: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
+    page_number = 1
     while url:
         if url in seen_urls:
             safe_url = sanitize_api_key_from_url(url)
             raise RuntimeError(f"Massive ticker pagination loop detected at {safe_url}")
         seen_urls.add(url)
 
-        payload = fetcher(url)
+        if progress_callback:
+            progress_callback(f"Fetching Massive ticker reference page {page_number}...")
+        payload = fetcher(url, page_number)
         pages.append(payload)
 
         next_url = payload.get("next_url")
+        if progress_callback:
+            row_count = len(payload_results(payload))
+            progress_callback(
+                f"Fetched page {page_number}: "
+                f"rows={row_count} next_page={str(isinstance(next_url, str) and bool(next_url.strip())).lower()}"
+            )
         if not isinstance(next_url, str) or not next_url.strip():
             break
         url = ensure_api_key_param(next_url.strip(), api_key)
+        page_number += 1
 
     return pages
 

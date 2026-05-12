@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write under this local directory instead of S3, mirroring S3 key layout",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress page fetch and retry progress logs",
+    )
     return parser.parse_args()
 
 
@@ -86,6 +91,7 @@ def main() -> int:
     args = parse_args()
     date_str = args.date or utc_date()
     api_key = resolve_massive_api_key()
+    progress_callback = None if args.quiet else lambda message: print(message, flush=True)
 
     payloads = fetch_massive_ticker_pages(
         api_key=api_key,
@@ -96,6 +102,7 @@ def main() -> int:
         max_retries=args.max_retries,
         base_sleep_seconds=args.base_sleep_seconds,
         max_sleep_seconds=args.max_sleep_seconds,
+        progress_callback=progress_callback,
     )
     rows = normalize_massive_ticker_payloads(
         payloads,
@@ -108,24 +115,25 @@ def main() -> int:
         for page, payload in enumerate(payloads, start=1):
             raw_key = raw_ticker_reference_key(args.raw_prefix, date_str, page)
             path = write_raw_json_local(args.local_output_dir, raw_key, payload)
-            print(f"wrote raw local: {path}")
+            print(f"wrote raw local: {path}", flush=True)
 
         path = write_curated_parquet_local(args.local_output_dir, curated_key, table)
-        print(f"wrote curated local: {path} rows={table.num_rows}")
+        print(f"wrote curated local: {path} rows={table.num_rows}", flush=True)
     else:
         s3_client = boto3.client("s3")
         for page, payload in enumerate(payloads, start=1):
             raw_key = raw_ticker_reference_key(args.raw_prefix, date_str, page)
             write_raw_json_s3(s3_client, args.bucket, raw_key, payload)
-            print(f"wrote raw s3: s3://{args.bucket}/{raw_key}")
+            print(f"wrote raw s3: s3://{args.bucket}/{raw_key}", flush=True)
 
         write_curated_parquet_s3(s3_client, args.bucket, curated_key, table)
-        print(f"wrote curated s3: s3://{args.bucket}/{curated_key} rows={table.num_rows}")
+        print(f"wrote curated s3: s3://{args.bucket}/{curated_key} rows={table.num_rows}", flush=True)
 
     print(
         "massive ticker reference ingest complete: "
         f"date={date_str} market={args.market} locale={args.locale} "
-        f"active={args.active} pages={len(payloads)} rows={table.num_rows}"
+        f"active={args.active} pages={len(payloads)} rows={table.num_rows}",
+        flush=True,
     )
     return 0
 

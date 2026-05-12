@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from argparse import Namespace
 from email.message import Message
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,31 @@ def test_pagination_helper_handles_next_url_and_adds_api_key() -> None:
     assert second_query["apiKey"] == ["secret"]
 
 
+def test_fetch_massive_ticker_pages_emits_progress_for_successful_pages() -> None:
+    messages: list[str] = []
+
+    def fake_fetcher(url: str) -> dict[str, object]:
+        if "cursor=abc" in url:
+            return {"results": [{"ticker": "MSFT"}]}
+        return {
+            "results": [{"ticker": "AAPL"}],
+            "next_url": "https://api.massive.com/v3/reference/tickers?cursor=abc",
+        }
+
+    ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        page_fetcher=fake_fetcher,
+        progress_callback=messages.append,
+    )
+
+    assert messages == [
+        "Fetching Massive ticker reference page 1...",
+        "Fetched page 1: rows=1 next_page=true",
+        "Fetching Massive ticker reference page 2...",
+        "Fetched page 2: rows=1 next_page=false",
+    ]
+
+
 def test_fetch_massive_ticker_page_retries_429_then_succeeds() -> None:
     sleeps: list[float] = []
     opener, urls = queued_opener([http_error(429), {"status": "OK", "results": []}])
@@ -169,6 +195,28 @@ def test_fetch_massive_ticker_page_retries_429_then_succeeds() -> None:
     assert payload["status"] == "OK"
     assert len(urls) == 2
     assert sleeps == [2.0]
+
+
+def test_fetch_massive_ticker_page_emits_progress_for_429_retry() -> None:
+    sleeps: list[float] = []
+    messages: list[str] = []
+    opener, _urls = queued_opener([http_error(429), {"status": "OK", "results": []}])
+
+    ticker_reference.fetch_massive_ticker_page(
+        "https://api.massive.com/v3/reference/tickers?apiKey=secret",
+        opener=opener,
+        sleeper=sleeps.append,
+        progress_callback=messages.append,
+        page_number=3,
+        max_retries=8,
+        base_sleep_seconds=10.0,
+    )
+
+    assert messages == [
+        "HTTP 429 fetching page 3. Sleeping 10.0 seconds before retry 1/8..."
+    ]
+    assert "secret" not in messages[0]
+    assert sleeps == [10.0]
 
 
 def test_fetch_massive_ticker_page_respects_retry_after_header() -> None:
@@ -283,6 +331,52 @@ def test_fetch_massive_ticker_pages_passes_retry_config(monkeypatch: pytest.Monk
     assert calls[0]["base_sleep_seconds"] == 5.0
     assert calls[0]["max_sleep_seconds"] == 90.0
     assert calls[0]["sleeper"] is sleeper
+    assert calls[0]["progress_callback"] is None
+    assert calls[0]["page_number"] == 1
+
+
+def test_ingest_script_quiet_suppresses_progress_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sys.path.insert(0, str(REPO_ROOT))
+    from scripts import ingest_massive_ticker_reference as ingest_script
+
+    def fake_fetch_pages(**kwargs: object) -> list[dict[str, object]]:
+        progress_callback = kwargs["progress_callback"]
+        if progress_callback:
+            progress_callback("Fetching Massive ticker reference page 1...")
+        return [{"results": []}]
+
+    monkeypatch.setattr(
+        ingest_script,
+        "parse_args",
+        lambda: Namespace(
+            bucket="unused",
+            raw_prefix="raw/reference/massive_tickers",
+            curated_key="curated/reference/ticker_reference/data.parquet",
+            date="2026-05-09",
+            market="stocks",
+            active=True,
+            locale="us",
+            limit=1000,
+            max_retries=8,
+            base_sleep_seconds=5.0,
+            max_sleep_seconds=90.0,
+            common_stock_type=["CS"],
+            local_output_dir=tmp_path,
+            quiet=True,
+        ),
+    )
+    monkeypatch.setattr(ingest_script, "resolve_massive_api_key", lambda: "secret")
+    monkeypatch.setattr(ingest_script, "fetch_massive_ticker_pages", fake_fetch_pages)
+
+    assert ingest_script.main() == 0
+
+    output = capsys.readouterr().out
+    assert "Fetching Massive ticker reference page" not in output
+    assert "massive ticker reference ingest complete:" in output
 
 
 def test_common_stock_classification_defaults_to_cs_only() -> None:
