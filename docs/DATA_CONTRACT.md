@@ -101,6 +101,7 @@ Ticker reference schema:
 
 Ticker reference v1 note:
 - `is_common_stock_candidate` is conservative and defaults to active US stock-market tickers with Massive type `CS`.
+- Ticker reference diagnostics can be run with `python scripts/inspect_ticker_reference.py`.
 
 ## App assumptions
 

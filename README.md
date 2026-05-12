@@ -48,6 +48,7 @@ scripts/
   bootstrap_etf_symbol_metadata.py
   ingest_apewisdom_trends.py
   ingest_massive_ticker_reference.py
+  inspect_ticker_reference.py
   validate_etf_symbol_metadata.py
   package_lambda.sh
 src/us_market_data/
@@ -55,6 +56,7 @@ src/us_market_data/
   etf_metadata.py
   apewisdom.py
   ticker_reference.py
+  ticker_reference_diagnostics.py
 requirements/
   lambda.txt
   scripts.txt
@@ -174,6 +176,19 @@ MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_reference.py \
 
 The curated output includes a conservative `is_common_stock_candidate` flag. In v1, the default
 candidate logic is active US stock-market tickers with Massive type `CS`.
+
+Inspect the curated ticker reference parquet before downstream consumers use it:
+
+```bash
+python scripts/inspect_ticker_reference.py
+```
+
+To inspect the canonical S3 object explicitly:
+
+```bash
+python scripts/inspect_ticker_reference.py \
+  --input-path s3://us-market-data-casper/curated/reference/ticker_reference/data.parquet
+```
 
 ### 6. Deploy lambdas
 
