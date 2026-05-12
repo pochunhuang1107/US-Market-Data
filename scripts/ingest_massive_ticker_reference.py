@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", default=5, type=int)
     parser.add_argument("--base-sleep-seconds", default=2.0, type=float)
     parser.add_argument("--max-sleep-seconds", default=60.0, type=float)
+    parser.add_argument("--request-interval-seconds", default=0.0, type=float)
     parser.add_argument(
         "--common-stock-type",
         action="append",
@@ -102,6 +103,7 @@ def main() -> int:
         max_retries=args.max_retries,
         base_sleep_seconds=args.base_sleep_seconds,
         max_sleep_seconds=args.max_sleep_seconds,
+        request_interval_seconds=args.request_interval_seconds,
         progress_callback=progress_callback,
     )
     rows = normalize_massive_ticker_payloads(

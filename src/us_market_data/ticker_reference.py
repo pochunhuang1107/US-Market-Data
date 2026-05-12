@@ -233,11 +233,14 @@ def fetch_massive_ticker_pages(
     max_retries: int = 5,
     base_sleep_seconds: float = 2.0,
     max_sleep_seconds: float = 60.0,
+    request_interval_seconds: float = 0.0,
     sleeper: Callable[[float], Any] = time.sleep,
     progress_callback: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be >= 1")
+    if request_interval_seconds < 0:
+        raise ValueError("request_interval_seconds must be >= 0")
 
     def fetcher(fetch_url: str, page_number: int) -> dict[str, Any]:
         if page_fetcher:
@@ -283,6 +286,13 @@ def fetch_massive_ticker_pages(
             )
         if not isinstance(next_url, str) or not next_url.strip():
             break
+        if request_interval_seconds > 0:
+            if progress_callback:
+                progress_callback(
+                    f"Sleeping {request_interval_seconds:.1f} seconds before next page "
+                    "to respect rate limits..."
+                )
+            sleeper(request_interval_seconds)
         url = ensure_api_key_param(next_url.strip(), api_key)
         page_number += 1
 

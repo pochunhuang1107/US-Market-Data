@@ -182,6 +182,105 @@ def test_fetch_massive_ticker_pages_emits_progress_for_successful_pages() -> Non
     ]
 
 
+def test_fetch_massive_ticker_pages_sleeps_between_successful_pages() -> None:
+    sleeps: list[float] = []
+    messages: list[str] = []
+    seen_urls: list[str] = []
+
+    def fake_fetcher(url: str) -> dict[str, object]:
+        seen_urls.append(url)
+        if "cursor=page-2" in url:
+            return {
+                "results": [{"ticker": "MSFT"}],
+                "next_url": "https://api.massive.com/v3/reference/tickers?cursor=page-3",
+            }
+        if "cursor=page-3" in url:
+            return {"results": [{"ticker": "NVDA"}]}
+        return {
+            "results": [{"ticker": "AAPL"}],
+            "next_url": "https://api.massive.com/v3/reference/tickers?cursor=page-2",
+        }
+
+    pages = ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        page_fetcher=fake_fetcher,
+        request_interval_seconds=13.0,
+        sleeper=sleeps.append,
+        progress_callback=messages.append,
+    )
+
+    assert len(pages) == 3
+    assert len(seen_urls) == 3
+    assert sleeps == [13.0, 13.0]
+    assert messages.count(
+        "Sleeping 13.0 seconds before next page to respect rate limits..."
+    ) == 2
+
+
+def test_fetch_massive_ticker_pages_does_not_sleep_after_final_page() -> None:
+    sleeps: list[float] = []
+
+    pages = ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        page_fetcher=lambda _url: {"results": [{"ticker": "AAPL"}]},
+        request_interval_seconds=13.0,
+        sleeper=sleeps.append,
+    )
+
+    assert pages == [{"results": [{"ticker": "AAPL"}]}]
+    assert sleeps == []
+
+
+def test_fetch_massive_ticker_pages_does_not_sleep_when_request_interval_is_zero() -> None:
+    sleeps: list[float] = []
+    seen_urls: list[str] = []
+
+    def fake_fetcher(url: str) -> dict[str, object]:
+        seen_urls.append(url)
+        if len(seen_urls) == 1:
+            return {
+                "results": [{"ticker": "AAPL"}],
+                "next_url": "https://api.massive.com/v3/reference/tickers?cursor=abc",
+            }
+        return {"results": [{"ticker": "MSFT"}]}
+
+    ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        page_fetcher=fake_fetcher,
+        request_interval_seconds=0.0,
+        sleeper=sleeps.append,
+    )
+
+    assert len(seen_urls) == 2
+    assert sleeps == []
+
+
+def test_fetch_massive_ticker_pages_quiet_suppresses_pacing_progress() -> None:
+    sleeps: list[float] = []
+    messages: list[str] = []
+    seen_urls: list[str] = []
+
+    def fake_fetcher(url: str) -> dict[str, object]:
+        seen_urls.append(url)
+        if len(seen_urls) == 1:
+            return {
+                "results": [{"ticker": "AAPL"}],
+                "next_url": "https://api.massive.com/v3/reference/tickers?cursor=abc",
+            }
+        return {"results": [{"ticker": "MSFT"}]}
+
+    ticker_reference.fetch_massive_ticker_pages(
+        api_key="secret",
+        page_fetcher=fake_fetcher,
+        request_interval_seconds=13.0,
+        sleeper=sleeps.append,
+        progress_callback=None,
+    )
+
+    assert sleeps == [13.0]
+    assert messages == []
+
+
 def test_fetch_massive_ticker_page_retries_429_then_succeeds() -> None:
     sleeps: list[float] = []
     opener, urls = queued_opener([http_error(429), {"status": "OK", "results": []}])
@@ -323,6 +422,7 @@ def test_fetch_massive_ticker_pages_passes_retry_config(monkeypatch: pytest.Monk
         max_retries=8,
         base_sleep_seconds=5.0,
         max_sleep_seconds=90.0,
+        request_interval_seconds=13.0,
         sleeper=sleeper,
     )
 
@@ -344,9 +444,11 @@ def test_ingest_script_quiet_suppresses_progress_output(
     from scripts import ingest_massive_ticker_reference as ingest_script
 
     def fake_fetch_pages(**kwargs: object) -> list[dict[str, object]]:
+        assert kwargs["request_interval_seconds"] == 13.0
         progress_callback = kwargs["progress_callback"]
         if progress_callback:
             progress_callback("Fetching Massive ticker reference page 1...")
+            progress_callback("Sleeping 13.0 seconds before next page to respect rate limits...")
         return [{"results": []}]
 
     monkeypatch.setattr(
@@ -364,6 +466,7 @@ def test_ingest_script_quiet_suppresses_progress_output(
             max_retries=8,
             base_sleep_seconds=5.0,
             max_sleep_seconds=90.0,
+            request_interval_seconds=13.0,
             common_stock_type=["CS"],
             local_output_dir=tmp_path,
             quiet=True,
@@ -376,6 +479,7 @@ def test_ingest_script_quiet_suppresses_progress_output(
 
     output = capsys.readouterr().out
     assert "Fetching Massive ticker reference page" not in output
+    assert "Sleeping 13.0 seconds before next page to respect rate limits..." not in output
     assert "massive ticker reference ingest complete:" in output
 
 

@@ -10,3 +10,5 @@ build/
 EOF
 *.egg-info/
 data/local_apewisdom/
+
+data/
