@@ -4,7 +4,7 @@ import io
 import json
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -263,6 +263,105 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
     return pa.Table.from_arrays(arrays, schema=NORMALIZED_SCHEMA)
 
 
+def table_to_rows(table: pa.Table) -> list[dict[str, Any]]:
+    selected_columns = [
+        table.column(column).to_pylist()
+        if column in table.column_names
+        else [None] * table.num_rows
+        for column in NORMALIZED_COLUMNS
+    ]
+    rows: list[dict[str, Any]] = []
+    for index in range(table.num_rows):
+        rows.append(
+            {
+                column: selected_columns[column_index][index]
+                for column_index, column in enumerate(NORMALIZED_COLUMNS)
+            }
+        )
+    return rows
+
+
+def rows_from_parquet_bytes(body: bytes) -> list[dict[str, Any]]:
+    return table_to_rows(pq.read_table(io.BytesIO(body)))
+
+
+def normalize_ticker_overview_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    symbol = clean_upper_string(row.get("symbol"))
+    if not symbol:
+        return None
+    normalized = {column: row.get(column) for column in NORMALIZED_COLUMNS}
+    normalized["symbol"] = symbol
+    return normalized
+
+
+def merge_ticker_overview_rows(
+    existing_rows: list[dict[str, Any]],
+    fetched_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for row in [*existing_rows, *fetched_rows]:
+        normalized = normalize_ticker_overview_row(row)
+        if normalized is not None:
+            by_symbol[normalized["symbol"]] = normalized
+    return [by_symbol[symbol] for symbol in sorted(by_symbol)]
+
+
+def parse_ingested_at(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def stale_symbols(
+    existing_rows: list[dict[str, Any]],
+    requested_symbols: list[str],
+    refresh_after_days: int,
+    now: datetime | None = None,
+) -> list[str]:
+    normalized_requested = []
+    seen_requested: set[str] = set()
+    for requested_symbol in requested_symbols:
+        symbol = clean_upper_string(requested_symbol)
+        if symbol and symbol not in seen_requested:
+            normalized_requested.append(symbol)
+            seen_requested.add(symbol)
+
+    if refresh_after_days <= 0:
+        return normalized_requested
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    cutoff = current - timedelta(days=refresh_after_days)
+
+    existing_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in existing_rows:
+        normalized = normalize_ticker_overview_row(row)
+        if normalized is not None:
+            existing_by_symbol[normalized["symbol"]] = normalized
+
+    stale: list[str] = []
+    for symbol in normalized_requested:
+        row = existing_by_symbol.get(symbol)
+        if row is None:
+            stale.append(symbol)
+            continue
+        ingested_at = parse_ingested_at(row.get("ingested_at"))
+        if ingested_at is None or ingested_at < cutoff:
+            stale.append(symbol)
+    return stale
+
+
 def table_to_parquet_bytes(table: pa.Table) -> bytes:
     out = io.BytesIO()
     pq.write_table(table, out, compression="snappy")
@@ -289,6 +388,16 @@ def write_curated_parquet_local(local_output_dir: str | Path, key: str, table: p
     return write_bytes_local(local_output_dir, key, table_to_parquet_bytes(table))
 
 
+def read_curated_parquet_local(local_output_dir: str | Path, key: str) -> list[dict[str, Any]]:
+    path = local_path_for_key(local_output_dir, key)
+    if not path.exists():
+        return []
+    try:
+        return table_to_rows(pq.read_table(path))
+    except Exception as exc:
+        raise RuntimeError(f"failed reading existing curated parquet {path}: {exc}") from exc
+
+
 def write_raw_json_s3(s3_client: Any, bucket: str, key: str, payload: dict[str, Any]) -> str:
     s3_client.put_object(
         Bucket=bucket,
@@ -309,14 +418,37 @@ def write_curated_parquet_s3(s3_client: Any, bucket: str, key: str, table: pa.Ta
     return key
 
 
+def read_curated_parquet_s3(s3_client: Any, bucket: str, key: str) -> list[dict[str, Any]]:
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        body = response["Body"].read()
+    except Exception as exc:
+        error = getattr(exc, "response", {}).get("Error", {})
+        if error.get("Code") in {"NoSuchKey", "404", "NotFound"}:
+            return []
+        message = f"failed reading existing curated parquet s3://{bucket}/{key}: {exc}"
+        raise RuntimeError(message) from exc
+    try:
+        return rows_from_parquet_bytes(body)
+    except Exception as exc:
+        message = f"failed parsing existing curated parquet s3://{bucket}/{key}: {exc}"
+        raise RuntimeError(message) from exc
+
+
 __all__ = [
     "NORMALIZED_COLUMNS",
     "NORMALIZED_SCHEMA",
     "build_ticker_overview_url",
     "fetch_massive_ticker_overview",
+    "merge_ticker_overview_rows",
     "normalize_massive_ticker_overview_payload",
+    "read_curated_parquet_local",
+    "read_curated_parquet_s3",
     "resolve_massive_api_key",
+    "rows_from_parquet_bytes",
     "rows_to_table",
+    "stale_symbols",
+    "table_to_rows",
     "utc_date",
     "write_curated_parquet_local",
     "write_curated_parquet_s3",

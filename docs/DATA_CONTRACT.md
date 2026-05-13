@@ -137,7 +137,19 @@ Ticker overview manual ingest examples:
 ```bash
 python scripts/ingest_massive_ticker_overview.py --symbols IONQ,NVDA --local-output-dir data/local_ticker_overview
 python scripts/ingest_massive_ticker_overview.py --from-ticker-reference data/.../ticker_reference/data.parquet --limit 100
+python scripts/ingest_massive_ticker_overview.py \
+  --symbols-file ../US-Stock-Picker/data/public_profile_symbols/symbols.txt \
+  --s3-bucket us-market-data-casper \
+  --merge-existing \
+  --refresh-after-days 7 \
+  --fetch-limit 300
 ```
+
+Ticker overview cache note:
+- `curated/reference/ticker_overview/data.parquet` is a current profile cache when ingested with
+  `--merge-existing`, not only the latest run's selected symbols. Incremental runs read the existing
+  curated parquet, fetch missing or stale requested symbols, replace matching symbol rows, and keep
+  cached rows for symbols not fetched.
 
 ## App assumptions
 
@@ -165,7 +177,8 @@ The app should not assume:
 - Massive ticker reference raw files may be overwritten for the same date/page
 - Massive ticker reference curated parquet may be overwritten on each manual ingestion
 - Massive ticker overview raw files may be overwritten for the same date/symbol
-- Massive ticker overview curated parquet may be overwritten on each manual ingestion
+- Massive ticker overview curated parquet may be overwritten as a current cache snapshot; with
+  `--merge-existing`, rows for symbols not fetched are preserved
 
 ## Close vs finalize
 

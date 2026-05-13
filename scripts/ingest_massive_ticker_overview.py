@@ -20,9 +20,13 @@ from us_market_data.ticker_overview import (
     NORMALIZED_COLUMNS,
     NORMALIZED_SCHEMA,
     fetch_massive_ticker_overview,
+    merge_ticker_overview_rows,
     normalize_massive_ticker_overview_payload,
+    read_curated_parquet_local,
+    read_curated_parquet_s3,
     resolve_massive_api_key,
     rows_to_table,
+    stale_symbols,
     utc_date,
     write_curated_parquet_local,
     write_curated_parquet_s3,
@@ -35,9 +39,12 @@ __all__ = [
     "NORMALIZED_SCHEMA",
     "collect_symbols",
     "fetch_massive_ticker_overview",
+    "merge_ticker_overview_rows",
     "normalize_massive_ticker_overview_payload",
+    "read_existing_curated_rows",
     "resolve_massive_api_key",
     "rows_to_table",
+    "stale_symbols",
     "write_curated_parquet_local",
     "write_curated_parquet_s3",
     "write_raw_json_local",
@@ -72,6 +79,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", default=5, type=int)
     parser.add_argument("--base-sleep-seconds", default=2.0, type=float)
     parser.add_argument("--max-sleep-seconds", default=60.0, type=float)
+    parser.add_argument(
+        "--merge-existing",
+        action="store_true",
+        help="Read existing curated ticker overview parquet and upsert fetched rows into it.",
+    )
+    parser.add_argument(
+        "--refresh-after-days",
+        default=7,
+        type=int,
+        help="When --merge-existing is set, refetch cached symbols older than this many days.",
+    )
+    parser.add_argument(
+        "--fetch-limit",
+        default=None,
+        type=int,
+        help="When --merge-existing is set, fetch at most this many missing/stale symbols.",
+    )
     return parser.parse_args()
 
 
@@ -126,26 +150,30 @@ def collect_symbols(args: argparse.Namespace) -> list[str]:
     return dedupe_sort_limit(symbols, args.limit)
 
 
-def main() -> int:
-    args = parse_args()
-    if args.request_interval_seconds < 0:
-        raise ValueError("request_interval_seconds must be >= 0")
-    if not args.local_output_dir and not args.s3_bucket:
-        raise RuntimeError("provide --local-output-dir or --s3-bucket")
+def read_existing_curated_rows(
+    args: argparse.Namespace,
+    s3_client: object | None,
+    curated_key: str,
+) -> list[dict[str, object]]:
+    if args.local_output_dir:
+        return read_curated_parquet_local(args.local_output_dir, curated_key)
+    if not s3_client:
+        raise RuntimeError("s3_client is required when reading existing curated parquet from S3")
+    return read_curated_parquet_s3(s3_client, args.s3_bucket, curated_key)
 
-    date_str = utc_date()
-    api_key = resolve_massive_api_key()
-    symbols = collect_symbols(args)
-    if not symbols:
-        raise RuntimeError("no symbols selected")
 
-    s3_client = None if args.local_output_dir else boto3.client("s3")
+def fetch_and_write_rows(
+    args: argparse.Namespace,
+    symbols: list[str],
+    date_str: str,
+    api_key: str,
+    s3_client: object | None,
+    fetcher=fetch_massive_ticker_overview,
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    curated_key = curated_ticker_overview_key(args.curated_prefix)
-
     for index, symbol in enumerate(symbols, start=1):
         print(f"fetching {symbol} ({index}/{len(symbols)})", flush=True)
-        payload = fetch_massive_ticker_overview(
+        payload = fetcher(
             symbol=symbol,
             api_key=api_key,
             max_retries=args.max_retries,
@@ -170,7 +198,15 @@ def main() -> int:
                 flush=True,
             )
             time.sleep(args.request_interval_seconds)
+    return rows
 
+
+def write_curated_rows(
+    args: argparse.Namespace,
+    s3_client: object | None,
+    curated_key: str,
+    rows: list[dict[str, object]],
+):
     table = rows_to_table(rows)
     if args.local_output_dir:
         path = write_curated_parquet_local(args.local_output_dir, curated_key, table)
@@ -181,13 +217,92 @@ def main() -> int:
             f"wrote curated s3: s3://{args.s3_bucket}/{curated_key} rows={table.num_rows}",
             flush=True,
         )
+    return table
 
+
+def run_ingest(args: argparse.Namespace, fetcher=fetch_massive_ticker_overview) -> int:
+    if args.request_interval_seconds < 0:
+        raise ValueError("request_interval_seconds must be >= 0")
+    if args.fetch_limit is not None and args.fetch_limit < 0:
+        raise ValueError("fetch_limit must be >= 0")
+    if not args.local_output_dir and not args.s3_bucket:
+        raise RuntimeError("provide --local-output-dir or --s3-bucket")
+
+    date_str = utc_date()
+    symbols = collect_symbols(args)
+    if not symbols:
+        raise RuntimeError("no symbols selected")
+
+    s3_client = None if args.local_output_dir else boto3.client("s3")
+    curated_key = curated_ticker_overview_key(args.curated_prefix)
+
+    if args.merge_existing:
+        existing_rows = read_existing_curated_rows(args, s3_client, curated_key)
+        stale_or_missing_symbols = stale_symbols(
+            existing_rows,
+            symbols,
+            args.refresh_after_days,
+        )
+        symbols_to_fetch = (
+            stale_or_missing_symbols[: args.fetch_limit]
+            if args.fetch_limit is not None
+            else stale_or_missing_symbols
+        )
+        print(
+            "ticker overview upsert summary: "
+            f"desired_symbols={len(symbols)} "
+            f"existing_cached_rows={len(existing_rows)} "
+            f"stale_missing_selected={len(stale_or_missing_symbols)} "
+            f"fetch_limit={args.fetch_limit if args.fetch_limit is not None else 'none'} "
+            f"symbols_to_fetch={len(symbols_to_fetch)}",
+            flush=True,
+        )
+        if not symbols_to_fetch:
+            print(
+                "massive ticker overview ingest complete: "
+                f"date={date_str} desired_symbols={len(symbols)} "
+                f"existing_cached_rows={len(existing_rows)} "
+                f"stale_missing_selected={len(stale_or_missing_symbols)} "
+                f"fetched=0 final_curated_rows={len(existing_rows)}",
+                flush=True,
+            )
+            return 0
+
+        api_key = resolve_massive_api_key()
+        fetched_rows = fetch_and_write_rows(
+            args,
+            symbols_to_fetch,
+            date_str,
+            api_key,
+            s3_client,
+            fetcher=fetcher,
+        )
+        merged_rows = merge_ticker_overview_rows(existing_rows, fetched_rows)
+        table = write_curated_rows(args, s3_client, curated_key, merged_rows)
+        print(
+            "massive ticker overview ingest complete: "
+            f"date={date_str} desired_symbols={len(symbols)} "
+            f"existing_cached_rows={len(existing_rows)} "
+            f"stale_missing_selected={len(stale_or_missing_symbols)} "
+            f"fetched={len(fetched_rows)} final_curated_rows={table.num_rows}",
+            flush=True,
+        )
+        return 0
+
+    api_key = resolve_massive_api_key()
+    rows = fetch_and_write_rows(args, symbols, date_str, api_key, s3_client, fetcher=fetcher)
+    table = write_curated_rows(args, s3_client, curated_key, rows)
     print(
         "massive ticker overview ingest complete: "
         f"date={date_str} symbols={len(symbols)} rows={table.num_rows}",
         flush=True,
     )
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    return run_ingest(args)
 
 
 if __name__ == "__main__":

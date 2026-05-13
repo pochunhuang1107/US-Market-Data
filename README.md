@@ -225,6 +225,20 @@ The raw profile path is
 temporary server/network failures with configurable retry/backoff options, and `--request-interval-seconds`
 can pace symbol requests.
 
+Use `--merge-existing` when ingesting an incremental picker symbol list. In this mode,
+`curated/reference/ticker_overview/data.parquet` is treated as a current profile cache: the script
+reads the existing curated parquet, fetches only missing or stale requested symbols, upserts fresh
+rows by symbol, and keeps cached rows for symbols that were not part of the latest run.
+
+```bash
+python scripts/ingest_massive_ticker_overview.py \
+  --symbols-file ../US-Stock-Picker/data/public_profile_symbols/symbols.txt \
+  --s3-bucket us-market-data-casper \
+  --merge-existing \
+  --refresh-after-days 7 \
+  --fetch-limit 300
+```
+
 ### 7. Deploy lambdas
 
 Package each lambda with:
