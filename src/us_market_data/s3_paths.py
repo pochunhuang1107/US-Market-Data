@@ -40,3 +40,16 @@ def curated_ticker_reference_key(reference_prefix_or_key: str) -> str:
     if value.endswith(".parquet"):
         return value
     return f"{value}/ticker_reference/data.parquet"
+
+
+def raw_ticker_overview_key(raw_prefix: str, date_str: str, symbol: str) -> str:
+    return f"{raw_prefix}/date={date_str}/symbol={symbol}/data.json"
+
+
+def curated_ticker_overview_key(reference_prefix_or_key: str) -> str:
+    value = reference_prefix_or_key.strip("/")
+    if value.endswith(".parquet"):
+        return value
+    if value.endswith("/ticker_overview") or value == "ticker_overview":
+        return f"{value}/data.parquet"
+    return f"{value}/ticker_overview/data.parquet"

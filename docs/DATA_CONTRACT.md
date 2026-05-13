@@ -6,11 +6,13 @@
 Path:
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
 - `raw/reference/massive_tickers/date=YYYY-MM-DD/page=N/data.json`
+- `raw/reference/massive_ticker_overview/date=YYYY-MM-DD/symbol=SYMBOL/data.json`
 - `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 
 Purpose:
 - preserve source payloads for replay and debugging
 - preserve Massive ticker reference pages for replay and type-classification audits
+- preserve Massive ticker overview payloads for public stock profile enrichment audits
 - preserve ApeWisdom Reddit/social trend payloads as attention-signal source data
 
 ### Staging
@@ -70,11 +72,13 @@ Schema:
 Path:
 - `curated/reference/etf_symbol_metadata/data.parquet`
 - `curated/reference/ticker_reference/data.parquet`
+- `curated/reference/ticker_overview/data.parquet`
 
 Purpose:
 - cheap app lookup for symbol coverage window
 - avoid request-time history scans against curated ETF parquet
 - normalized Massive ticker metadata for downstream universe filtering
+- normalized Massive company profile metadata for US Stock Picker public stock detail pages
 
 ETF metadata schema:
 - `symbol` (string)
@@ -103,12 +107,45 @@ Ticker reference v1 note:
 - `is_common_stock_candidate` is conservative and defaults to active US stock-market tickers with Massive type `CS`.
 - Ticker reference diagnostics can be run with `python scripts/inspect_ticker_reference.py`.
 
+Ticker overview schema:
+- `symbol` (string)
+- `name` (string)
+- `market` (string)
+- `locale` (string)
+- `primary_exchange` (string)
+- `type` (string)
+- `active` (boolean)
+- `currency_name` (string)
+- `cik` (string)
+- `composite_figi` (string)
+- `share_class_figi` (string)
+- `market_cap` (double)
+- `weighted_shares_outstanding` (double)
+- `share_class_shares_outstanding` (double)
+- `sic_code` (string)
+- `sic_description` (string)
+- `description` (string)
+- `homepage_url` (string)
+- `total_employees` (int64)
+- `list_date` (string, ISO date when present)
+- `branding_logo_url` (string)
+- `branding_icon_url` (string)
+- `source` (string)
+- `ingested_at` (string, ISO timestamp UTC)
+
+Ticker overview manual ingest examples:
+```bash
+python scripts/ingest_massive_ticker_overview.py --symbols IONQ,NVDA --local-output-dir data/local_ticker_overview
+python scripts/ingest_massive_ticker_overview.py --from-ticker-reference data/.../ticker_reference/data.parquet --limit 100
+```
+
 ## App assumptions
 
 The app may assume:
 - ETF backtests use `curated/etf_daily_prices`
 - symbol coverage defaults use `curated/reference/etf_symbol_metadata/data.parquet`
 - ticker universe filtering may use `curated/reference/ticker_reference/data.parquet`
+- public stock profile pages may use `curated/reference/ticker_overview/data.parquet`
 - unsupported symbols should be rejected before simulation
 
 The app should not assume:
@@ -127,6 +164,8 @@ The app should not assume:
 - ApeWisdom staging parquet may be overwritten for the same date
 - Massive ticker reference raw files may be overwritten for the same date/page
 - Massive ticker reference curated parquet may be overwritten on each manual ingestion
+- Massive ticker overview raw files may be overwritten for the same date/symbol
+- Massive ticker overview curated parquet may be overwritten on each manual ingestion
 
 ## Close vs finalize
 

@@ -7,6 +7,7 @@ This repo is based on your current production flow:
 - monthly full-market staging parquet transform
 - ETF-only curated parquet update
 - ETF symbol metadata maintenance
+- Massive ticker overview company profile enrichment
 
 ## Scope
 
@@ -16,6 +17,7 @@ Current scope:
 - ETF-only curation to app-facing parquet
 - ETF symbol metadata parquet for app lookup
 - Massive ticker reference ingestion for common-stock filtering metadata
+- Massive ticker overview ingestion for public stock profile enrichment in US Stock Picker
 - Reddit/social trend ingestion from ApeWisdom as an attention signal
 - Manual/backfill scripts for curation and metadata bootstrap
 
@@ -28,12 +30,14 @@ Deferred on purpose:
 
 - `raw/massive/daily_market_summary/date=YYYY-MM-DD/data.json`
 - `raw/reference/massive_tickers/date=YYYY-MM-DD/page=N/data.json`
+- `raw/reference/massive_ticker_overview/date=YYYY-MM-DD/symbol=SYMBOL/data.json`
 - `raw/reddit/apewisdom/date=YYYY-MM-DD/hour=HH/filter=<filter>/data.json`
 - `staging/market_bars/year=YYYY/month=MM/data.parquet`
 - `staging/reddit_trends/date=YYYY-MM-DD/data.parquet`
 - `curated/etf_daily_prices/symbol=SYMBOL/year=YYYY/data.parquet`
 - `curated/reference/etf_symbol_metadata/data.parquet`
 - `curated/reference/ticker_reference/data.parquet`
+- `curated/reference/ticker_overview/data.parquet`
 
 ## Repo structure
 
@@ -49,6 +53,7 @@ scripts/
   bootstrap_etf_symbol_metadata.py
   ingest_apewisdom_trends.py
   ingest_massive_ticker_reference.py
+  ingest_massive_ticker_overview.py
   inspect_ticker_reference.py
   validate_etf_symbol_metadata.py
   package_lambda.sh
@@ -57,6 +62,7 @@ src/us_market_data/
   etf_metadata.py
   apewisdom.py
   ticker_reference.py
+  ticker_overview.py
   ticker_reference_diagnostics.py
 requirements/
   lambda.txt
@@ -192,7 +198,34 @@ python scripts/inspect_ticker_reference.py \
   --input-path s3://us-market-data-casper/curated/reference/ticker_reference/data.parquet
 ```
 
-### 6. Deploy lambdas
+### 6. Manually ingest Massive ticker overview profiles
+
+Fetch company profile fields from Massive Ticker Overview for selected symbols, write one raw JSON
+payload per symbol, and write a normalized curated parquet file for US Stock Picker public stock
+profile enrichment:
+
+```bash
+MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_overview.py \
+  --symbols IONQ,NVDA \
+  --local-output-dir data/local_ticker_overview
+```
+
+To select common-stock candidates from an existing ticker reference parquet, apply a safety limit:
+
+```bash
+MASSIVE_API_KEY=... python scripts/ingest_massive_ticker_overview.py \
+  --from-ticker-reference data/local_ticker_reference/curated/reference/ticker_reference/data.parquet \
+  --limit 100 \
+  --local-output-dir data/local_ticker_overview
+```
+
+The raw profile path is
+`raw/reference/massive_ticker_overview/date=YYYY-MM-DD/symbol=SYMBOL/data.json`; the curated output is
+`curated/reference/ticker_overview/data.parquet`. Overview ingestion retries rate limits and
+temporary server/network failures with configurable retry/backoff options, and `--request-interval-seconds`
+can pace symbol requests.
+
+### 7. Deploy lambdas
 
 Package each lambda with:
 
