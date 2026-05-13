@@ -24,10 +24,16 @@ All paths are configurable through environment variables.
 From the repo root:
 
 ```bash
-./scripts/package_lambda.sh massive_ticker_overview_ingest
+./scripts/package_lambda_linux_x86_64.sh massive_ticker_overview_ingest
 ```
 
-The ZIP artifact is created under `dist/`. Generated ZIP files and build artifacts under `dist/` and `build/` should not be committed.
+The Linux x86_64 ZIP artifact is created under `dist/`:
+
+```bash
+aws s3 cp dist/massive_ticker_overview_ingest_linux_x86_64.zip s3://us-market-data-casper/lambda-artifacts/massive_ticker_overview_ingest.zip
+```
+
+Generated ZIP files and build artifacts under `dist/` and `build/` should not be committed.
 
 ## Lambda configuration
 

@@ -59,6 +59,7 @@ scripts/
   inspect_ticker_reference.py
   validate_etf_symbol_metadata.py
   package_lambda.sh
+  package_lambda_linux_x86_64.sh
 src/us_market_data/
   s3_paths.py
   etf_metadata.py
@@ -257,6 +258,14 @@ Package each lambda with:
 
 Artifacts will be created under `dist/`.
 
+For Python 3.14 Lambdas deployed as zip packages on x86_64, build native dependencies in Docker
+instead of packaging Mac wheels locally:
+
+```bash
+./scripts/package_lambda_linux_x86_64.sh massive_ticker_overview_ingest
+aws s3 cp dist/massive_ticker_overview_ingest_linux_x86_64.zip s3://us-market-data-casper/lambda-artifacts/massive_ticker_overview_ingest.zip
+```
+
 For the ApeWisdom Lambda AWS Console setup, see `docs/APEWISDOM_LAMBDA_DEPLOYMENT.md`.
 Use `config/lambda_env_examples/apewisdom_reddit_trends_ingest.env.example` as the environment variable reference.
 
@@ -299,6 +308,7 @@ Lambda dependencies are intentionally small.
 
 - `boto3` is available in Lambda runtime
 - `pyarrow` is required for transform/curation and scripts
+- Lambda `pyarrow` versions must provide Python 3.14 Linux x86_64 wheels for zip packaging
 
 See:
 - `requirements/lambda.txt`
