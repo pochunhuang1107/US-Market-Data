@@ -38,6 +38,7 @@ Deferred on purpose:
 - `curated/reference/etf_symbol_metadata/data.parquet`
 - `curated/reference/ticker_reference/data.parquet`
 - `curated/reference/ticker_overview/data.parquet`
+- `curated/reference/public_profile_symbols/symbols.txt`
 
 ## Repo structure
 
@@ -46,6 +47,7 @@ lambdas/
   massive_daily_grouped_ingest/
   massive_daily_grouped_transform/
   massive_ticker_reference_ingest/
+  massive_ticker_overview_ingest/
   etf_parquet_update/
   apewisdom_reddit_trends_ingest/
 scripts/
@@ -74,6 +76,7 @@ docs/
   APEWISDOM_LAMBDA_DEPLOYMENT.md
   DATA_CONTRACT.md
   MASSIVE_TICKER_REFERENCE_LAMBDA_DEPLOYMENT.md
+  MASSIVE_TICKER_OVERVIEW_LAMBDA_DEPLOYMENT.md
 ```
 
 ## Metadata design
@@ -247,6 +250,7 @@ Package each lambda with:
 ./scripts/package_lambda.sh massive_daily_grouped_ingest
 ./scripts/package_lambda.sh massive_daily_grouped_transform
 ./scripts/package_lambda.sh massive_ticker_reference_ingest
+./scripts/package_lambda.sh massive_ticker_overview_ingest
 ./scripts/package_lambda.sh etf_parquet_update
 ./scripts/package_lambda.sh apewisdom_reddit_trends_ingest
 ```
@@ -257,6 +261,8 @@ For the ApeWisdom Lambda AWS Console setup, see `docs/APEWISDOM_LAMBDA_DEPLOYMEN
 Use `config/lambda_env_examples/apewisdom_reddit_trends_ingest.env.example` as the environment variable reference.
 
 For the Massive ticker reference Lambda AWS Console setup, see `docs/MASSIVE_TICKER_REFERENCE_LAMBDA_DEPLOYMENT.md`.
+
+For the Massive ticker overview upsert Lambda AWS Console setup, see `docs/MASSIVE_TICKER_OVERVIEW_LAMBDA_DEPLOYMENT.md`.
 
 ## Lambda schedules
 
@@ -276,6 +282,11 @@ Recommended mapping from your current schedule:
 
 - `massive-ticker-reference-ingest`
   - suggested future EventBridge cadence: weekly Saturday morning after Friday market data is finalized
+  - not deployed or scheduled by this repo change
+
+- `massive-ticker-overview-ingest`
+  - suggested future EventBridge cadence: once daily after the stock-picker public symbol refresh
+  - upserts the selected public-profile cache only; it is not a full-universe ingestion
   - not deployed or scheduled by this repo change
 
 - `apewisdom-reddit-trends-ingest`

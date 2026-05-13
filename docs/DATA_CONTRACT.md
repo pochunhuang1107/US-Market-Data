@@ -73,12 +73,14 @@ Path:
 - `curated/reference/etf_symbol_metadata/data.parquet`
 - `curated/reference/ticker_reference/data.parquet`
 - `curated/reference/ticker_overview/data.parquet`
+- `curated/reference/public_profile_symbols/symbols.txt`
 
 Purpose:
 - cheap app lookup for symbol coverage window
 - avoid request-time history scans against curated ETF parquet
 - normalized Massive ticker metadata for downstream universe filtering
 - normalized Massive company profile metadata for US Stock Picker public stock detail pages
+- selected public stock symbols requested by the stock-picker profile cache job
 
 ETF metadata schema:
 - `symbol` (string)
@@ -150,6 +152,10 @@ Ticker overview cache note:
   `--merge-existing`, not only the latest run's selected symbols. Incremental runs read the existing
   curated parquet, fetch missing or stale requested symbols, replace matching symbol rows, and keep
   cached rows for symbols not fetched.
+- The `massive-ticker-overview-ingest` Lambda reads desired symbols from
+  `curated/reference/public_profile_symbols/symbols.txt` by default and writes the same raw and
+  curated paths as the manual upsert command. Schedule it after the stock-picker symbol refresh, once
+  daily. This is a selected public-profile cache upsert, not a full-universe ingestion.
 
 ## App assumptions
 
