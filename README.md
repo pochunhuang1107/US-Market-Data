@@ -207,6 +207,22 @@ does not call external APIs, does not write to S3, does not change Massive autom
 overwrite the existing Tiingo adjusted source directory. Validate the materialized source with
 `--raw-dir data/manual_backfill/raw/tiingo_raw_compatible` and `--source-provider tiingo_raw`.
 
+Before relying on Tiingo raw-compatible history for long-run research, run the local split
+discontinuity diagnostic against the already-downloaded Tiingo CSVs:
+
+```bash
+python scripts/diagnose_tiingo_raw_split_discontinuities.py \
+  --tiingo-raw-dir data/manual_backfill/raw/tiingo \
+  --symbols-file config/etf_symbols.example.txt \
+  --output-dir data/manual_backfill_tiingo_raw_diagnostics
+```
+
+This writes `split_discontinuity_event_report.csv`,
+`split_discontinuity_symbol_summary.csv`, and `split_discontinuity_report.md`. It does not call
+Tiingo, write to S3, promote data, or change Massive automation. If split discontinuities are
+present, build a separate Tiingo split-adjusted source from raw prices plus `split_factor` before
+any overnight ML run.
+
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
 
