@@ -53,6 +53,7 @@ lambdas/
 scripts/
   backfill_curated_etf_from_staging.py
   bootstrap_etf_symbol_metadata.py
+  validate_manual_historical_etf_backfill.py
   ingest_apewisdom_trends.py
   ingest_massive_ticker_reference.py
   ingest_massive_ticker_overview.py
@@ -133,7 +134,35 @@ python scripts/validate_etf_symbol_metadata.py \
   --metadata-key curated/reference/etf_symbol_metadata/data.parquet
 ```
 
-### 4. Manually ingest ApeWisdom Reddit trends
+### 4. Validate local manual historical ETF backfills
+
+The manual historical ETF backfill validator is local-only. It reads manually downloaded ETF CSVs,
+normalizes valid OHLCV price rows, stages curated-style parquet under
+`data/manual_backfill/curated_export/source=<source>/etf_daily_prices/`, and writes validation
+reports under `data/manual_backfill/validation/`.
+
+Dividend, split, distribution, and other event/non-price rows are quarantined before price
+normalization. They are written to `data/manual_backfill/events/source=<source>/<SYMBOL>_events.csv`,
+summarized in `validation/event_rows_report.csv`, and excluded from normalized and curated-style ETF
+price parquet. If these events are needed later, handle them as a separate corporate-action/event
+dataset rather than mixing them into ETF price history.
+
+Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
+not the manual ETF price backfill.
+
+```bash
+python scripts/validate_manual_historical_etf_backfill.py \
+  --raw-dir data/manual_backfill/raw/stooq \
+  --source-provider stooq \
+  --massive-curated-dir data/manual_backfill/massive_curated_sample \
+  --output-dir data/manual_backfill \
+  --symbols-file config/etf_symbols.example.txt \
+  --backfill-end-date 2017-12-31 \
+  --overlap-start-date 2018-01-01 \
+  --overlap-end-date 2026-05-08
+```
+
+### 5. Manually ingest ApeWisdom Reddit trends
 
 Fetch the current ApeWisdom `all-stocks` page, write the raw payload, and write a normalized
 daily staging parquet file:
@@ -155,7 +184,7 @@ python scripts/ingest_apewisdom_trends.py \
 ApeWisdom tracks stock/crypto mentions across Reddit and 4chan boards. Treat this data as an
 attention signal, not a buy/sell signal.
 
-### 5. Manually ingest Massive ticker reference
+### 6. Manually ingest Massive ticker reference
 
 Fetch active US stock-market ticker reference metadata from Massive, write each raw response page,
 and write a normalized curated parquet dataset:
@@ -202,7 +231,7 @@ python scripts/inspect_ticker_reference.py \
   --input-path s3://us-market-data-casper/curated/reference/ticker_reference/data.parquet
 ```
 
-### 6. Manually ingest Massive ticker overview profiles
+### 7. Manually ingest Massive ticker overview profiles
 
 Fetch company profile fields from Massive Ticker Overview for selected symbols, write one raw JSON
 payload per symbol, and write a normalized curated parquet file for US Stock Picker public stock
@@ -243,7 +272,7 @@ python scripts/ingest_massive_ticker_overview.py \
   --fetch-limit 300
 ```
 
-### 7. Deploy lambdas
+### 8. Deploy lambdas
 
 Package each lambda with:
 

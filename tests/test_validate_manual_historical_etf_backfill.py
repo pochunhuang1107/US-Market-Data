@@ -33,6 +33,11 @@ def write_symbols(path: Path, symbols: list[str]) -> None:
     path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
 
 
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
 def args_for(
     tmp_path: Path,
     *,
@@ -95,6 +100,110 @@ def test_csv_normalization_accepts_common_title_case_columns(tmp_path: Path) -> 
         "vwap": None,
         "transactions": None,
     }
+
+
+def test_event_rows_are_quarantined_and_excluded_from_price_outputs(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(
+        raw_dir / "SPY.csv",
+        [
+            {
+                "Date": "2017-12-29",
+                "Open": 100,
+                "High": 103,
+                "Low": 99,
+                "Close": 102,
+                "Volume": 10,
+                "Action": "",
+                "Amount": "",
+            },
+            {
+                "Date": "2017-12-30",
+                "Open": "",
+                "High": "",
+                "Low": "",
+                "Close": "",
+                "Volume": "",
+                "Action": "Dividend",
+                "Amount": "0.24",
+            },
+            {
+                "Date": "2017-12-31",
+                "Open": "",
+                "High": "",
+                "Low": "",
+                "Close": "",
+                "Volume": "",
+                "Action": "Split",
+                "Amount": "2:1",
+            },
+            {
+                "Date": "2018-01-02",
+                "Open": 102,
+                "High": 105,
+                "Low": 101,
+                "Close": 104,
+                "Volume": 11,
+                "Action": "",
+                "Amount": "",
+            },
+        ],
+        fieldnames=["Date", "Open", "High", "Low", "Close", "Volume", "Action", "Amount"],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    event_path = output_dir / "events" / "source=stooq" / "SPY_events.csv"
+    assert event_path.exists()
+    event_rows = read_csv_rows(event_path)
+    assert [row["Date"] for row in event_rows] == ["2017-12-30", "2017-12-31"]
+    assert event_rows[0]["_event_types_detected"] == "action;dividend"
+    assert event_rows[1]["_event_types_detected"] == "action;split"
+
+    normalized_rows = pq.ParquetFile(
+        output_dir / "normalized" / "stooq" / "SPY.parquet"
+    ).read().to_pylist()
+    assert [row["date"] for row in normalized_rows] == ["2017-12-29", "2018-01-02"]
+
+    export_path = (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+        / "symbol=SPY"
+        / "year=2017"
+        / "data.parquet"
+    )
+    exported_rows = pq.ParquetFile(export_path).read().to_pylist()
+    assert [row["date"] for row in exported_rows] == ["2017-12-29"]
+
+    event_report_rows = read_csv_rows(
+        output_dir / "validation" / "event_rows_report.csv"
+    )
+    assert event_report_rows[0]["raw_row_count"] == "4"
+    assert event_report_rows[0]["price_row_count"] == "2"
+    assert event_report_rows[0]["event_row_count"] == "2"
+    assert event_report_rows[0]["event_output_path"] == str(event_path)
+    assert event_report_rows[0]["event_types_detected"] == "action;dividend;split"
+    assert result.event_rows[0]["event_row_count"] == 2
+
+    quality_rows = read_csv_rows(
+        output_dir / "validation" / "symbol_quality_report.csv"
+    )
+    assert quality_rows[0]["event_row_count"] == "2"
+    assert "quarantined" in quality_rows[0]["event_warning"]
 
 
 def test_duplicate_symbol_date_rows_are_removed_deterministically(tmp_path: Path) -> None:
@@ -209,6 +318,16 @@ def test_pre_massive_export_rule_and_partition_output(tmp_path: Path) -> None:
     ).exists()
     assert result.coverage_rows[0]["backfill_row_count"] == 1
     assert result.coverage_rows[0]["exported_years"] == "2017"
+    event_report_rows = read_csv_rows(
+        output_dir / "validation" / "event_rows_report.csv"
+    )
+    assert event_report_rows[0]["event_row_count"] == "0"
+    assert event_report_rows[0]["event_output_path"] == ""
+    quality_rows = read_csv_rows(
+        output_dir / "validation" / "symbol_quality_report.csv"
+    )
+    assert quality_rows[0]["event_row_count"] == "0"
+    assert quality_rows[0]["event_warning"] == ""
 
 
 def test_overlap_comparison_against_synthetic_massive_curated_sample(tmp_path: Path) -> None:
