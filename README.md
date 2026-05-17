@@ -163,6 +163,33 @@ in `infer_from_massive` mode and are marked `missing_massive_sample` in
 `validation/massive_boundary_report.csv`; this avoids accidentally exporting all historical source
 rows.
 
+To compare Tiingo against the local Stooq manual backfill before any promotion decision, use the
+local-only Tiingo downloader. It reads `TIINGO_API_TOKEN` from the environment, sends the token only
+in the API request header, writes normalized source CSVs under
+`data/manual_backfill/raw/tiingo/`, and writes `tiingo_download_manifest.csv` plus
+`tiingo_download_summary.md` under `data/manual_backfill/validation/`. It does not write to S3,
+does not promote historical data, and does not change Massive automation.
+
+```bash
+python scripts/download_tiingo_historical_etf_data.py \
+  --symbols-file config/etf_symbols.example.txt \
+  --start-date 1999-01-01 \
+  --output-dir data/manual_backfill/raw/tiingo \
+  --price-mode adjusted
+```
+
+Then validate Tiingo with the same manual backfill validator:
+
+```bash
+python scripts/validate_manual_historical_etf_backfill.py \
+  --raw-dir data/manual_backfill/raw/tiingo \
+  --source-provider tiingo \
+  --massive-curated-dir data/manual_backfill/massive_curated_sample \
+  --output-dir data/manual_backfill \
+  --symbols-file config/etf_symbols.example.txt \
+  --backfill-boundary-mode infer_from_massive
+```
+
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
 
