@@ -223,6 +223,23 @@ Tiingo, write to S3, promote data, or change Massive automation. If split discon
 present, build a separate Tiingo split-adjusted source from raw prices plus `split_factor` before
 any overnight ML run.
 
+To create the current local Tiingo-only adjusted ML research parquet dataset from already-downloaded
+Tiingo CSVs, run:
+
+```bash
+bash scripts/create_tiingo_only_adjusted_etf_research_dataset.sh
+```
+
+This writes `data/research/etf_daily_prices_tiingo_only/symbol=SYMBOL/year=YYYY/data.parquet`
+plus `_reports/tiingo_only_adjusted_manifest.csv` and
+`_reports/tiingo_only_adjusted_summary.md`. It uses Tiingo adjusted OHLCV as the research source of
+truth, does not call Tiingo, does not write to S3, does not modify Massive production/app data, and
+does not use the older Tiingo/Massive bridged extended dataset. The ML research glob is:
+
+```text
+/Users/casper/Projects/Research/Market Data/data/research/etf_daily_prices_tiingo_only/**/*.parquet
+```
+
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
 
