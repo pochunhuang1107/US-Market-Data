@@ -148,7 +148,7 @@ def test_local_staging_parquet_write_works_with_tmp_path(tmp_path: Path) -> None
     key = staging_reddit_trends_key("staging/reddit_trends", "2026-05-09")
 
     path = apewisdom.write_staging_parquet_local(tmp_path, key, table)
-    round_trip = pq.read_table(path)
+    round_trip = pq.ParquetFile(path).read()
 
     assert path == tmp_path / "staging/reddit_trends/date=2026-05-09/data.parquet"
     assert round_trip.schema.names == apewisdom.NORMALIZED_COLUMNS
