@@ -388,6 +388,142 @@ def test_overlap_comparison_against_synthetic_massive_curated_sample(tmp_path: P
     assert overlap["close_pct_diff_max"] == 0.0
     assert overlap["return_1d_abs_diff_max"] == 0.0
     assert overlap["overlap_quality_status"] == "pass"
+    diagnostics = result.adjustment_diagnostics_rows[0]
+    assert diagnostics["return_alignment_status"] == "pass"
+    assert diagnostics["price_level_status"] == "pass"
+    assert diagnostics["adjustment_diagnostic_status"] == "pass"
+    assert diagnostics["suggested_action"] == "use_as_is"
+    assert diagnostics["boundary_rebase_factor"] == 1.0
+    assert (output_dir / "validation" / "adjustment_diagnostics_report.csv").exists()
+
+
+def test_adjustment_diagnostics_rebase_candidate_for_stable_price_ratio(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 204.0,
+                "high": 210.0,
+                "low": 202.0,
+                "close": 208.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 208.0,
+                "high": 212.0,
+                "low": 206.0,
+                "close": 210.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    diagnostics = result.adjustment_diagnostics_rows[0]
+    assert result.overlap_rows[0]["overlap_quality_status"] == "fail"
+    assert diagnostics["return_alignment_status"] == "pass"
+    assert diagnostics["price_level_status"] == "adjusted_level_mismatch"
+    assert diagnostics["adjustment_diagnostic_status"] == "rebase_candidate"
+    assert diagnostics["suggested_action"] == "rebase_pre_massive_history_before_promotion"
+    assert diagnostics["close_ratio_mean"] == 2.0
+    assert diagnostics["close_ratio_cv"] == 0.0
+    assert diagnostics["close_ratio_drift_abs"] == 0.0
+    assert diagnostics["boundary_rebase_factor"] == 2.0
+
+    quality_rows = read_csv_rows(
+        output_dir / "validation" / "symbol_quality_report.csv"
+    )
+    assert quality_rows[0]["adjustment_diagnostic_status"] == "rebase_candidate"
+    assert (
+        quality_rows[0]["suggested_action"]
+        == "rebase_pre_massive_history_before_promotion"
+    )
+
+
+def test_adjustment_diagnostics_fail_when_returns_do_not_align(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 118.0,
+                "high": 121.0,
+                "low": 117.0,
+                "close": 120.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    diagnostics = result.adjustment_diagnostics_rows[0]
+    assert diagnostics["return_alignment_status"] == "fail"
+    assert diagnostics["adjustment_diagnostic_status"] == "fail"
+    assert diagnostics["suggested_action"] == "inspect_source_quality"
 
 
 def test_missing_massive_overlap_sample_warns_without_crashing(tmp_path: Path) -> None:
@@ -411,6 +547,69 @@ def test_missing_massive_overlap_sample_warns_without_crashing(tmp_path: Path) -
 
     assert result.overlap_rows[0]["overlap_quality_status"] == "warning"
     assert "missing local Massive curated sample for SPY" in result.overlap_rows[0]["warning"]
+    assert result.adjustment_diagnostics_rows[0]["adjustment_diagnostic_status"] == "warning"
+    assert result.adjustment_diagnostics_rows[0]["suggested_action"] == "missing_massive_sample"
     assert result.manifest["warning_count"] >= 1
     assert (output_dir / "validation" / "overlap_report.csv").exists()
+    assert (output_dir / "validation" / "adjustment_diagnostics_report.csv").exists()
     assert not (output_dir / "normalized" / "stooq" / "SPY.parquet").exists()
+
+
+def test_summary_markdown_includes_adjustment_diagnostics_section(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 204.0,
+                "high": 210.0,
+                "low": 202.0,
+                "close": 208.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 208.0,
+                "high": 212.0,
+                "low": 206.0,
+                "close": 210.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    summary = (output_dir / "validation" / "manual_backfill_summary.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## Adjustment Diagnostics Summary" in summary
+    assert "rebase_candidate=1" in summary
+    assert "Rebase candidates: SPY" in summary
+    assert "Large price-level differences with aligned one-day returns" in summary
+    assert "No rebasing is performed" in summary

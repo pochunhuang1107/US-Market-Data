@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median, pstdev
 from typing import Any, Iterable
 
 import pyarrow as pa
@@ -42,6 +42,7 @@ CURATED_ETF_SCHEMA = pa.schema(
 REPORT_FILENAMES = {
     "coverage": "coverage_report.csv",
     "overlap": "overlap_report.csv",
+    "adjustment_diagnostics": "adjustment_diagnostics_report.csv",
     "event_rows": "event_rows_report.csv",
     "symbol_quality": "symbol_quality_report.csv",
     "manifest": "backfill_manifest.json",
@@ -50,6 +51,9 @@ REPORT_FILENAMES = {
 
 OVERLAP_CLOSE_PCT_FAIL_THRESHOLD = 0.05
 OVERLAP_RETURN_DIFF_FAIL_THRESHOLD = 0.05
+RATIO_CV_REBASE_CANDIDATE_THRESHOLD = 0.01
+RATIO_DRIFT_REBASE_CANDIDATE_THRESHOLD = 0.03
+RETURN_DIFF_WARNING_THRESHOLD = 0.005
 PRICE_COLUMN_NAMES = {
     "date",
     "open",
@@ -90,6 +94,7 @@ class SymbolResult:
 class ValidationRunResult:
     coverage_rows: list[dict[str, Any]]
     overlap_rows: list[dict[str, Any]]
+    adjustment_diagnostics_rows: list[dict[str, Any]]
     event_rows: list[dict[str, Any]]
     symbol_quality_rows: list[dict[str, Any]]
     manifest: dict[str, Any]
@@ -516,8 +521,199 @@ def metric_mean(values: list[float]) -> float | None:
     return mean(values) if values else None
 
 
+def metric_median(values: list[float]) -> float | None:
+    return median(values) if values else None
+
+
 def metric_max(values: list[float]) -> float | None:
     return max(values) if values else None
+
+
+def metric_min(values: list[float]) -> float | None:
+    return min(values) if values else None
+
+
+def metric_std(values: list[float]) -> float | None:
+    return pstdev(values) if values else None
+
+
+def ratio_cv(std_value: float | None, mean_value: float | None) -> float | None:
+    if std_value is None or mean_value is None or mean_value == 0:
+        return None
+    return std_value / abs(mean_value)
+
+
+def build_adjustment_diagnostics_row(
+    *,
+    symbol: str,
+    source_provider: str,
+    source_table: pa.Table,
+    massive_table: pa.Table | None,
+    overlap_start_date: str,
+    overlap_end_date: str,
+) -> dict[str, Any]:
+    source_rows = table_rows_between(source_table, overlap_start_date, overlap_end_date)
+    warning = ""
+
+    if massive_table is None:
+        warning = f"missing local Massive curated sample for {symbol}"
+        return {
+            "symbol": symbol,
+            "source_provider": source_provider,
+            "overlap_start": overlap_start_date,
+            "overlap_end": overlap_end_date,
+            "joined_rows": 0,
+            "close_ratio_mean": None,
+            "close_ratio_median": None,
+            "close_ratio_std": None,
+            "close_ratio_min": None,
+            "close_ratio_max": None,
+            "close_ratio_start": None,
+            "close_ratio_end": None,
+            "close_ratio_drift_abs": None,
+            "close_ratio_cv": None,
+            "close_pct_diff_mean": None,
+            "close_pct_diff_max": None,
+            "return_1d_abs_diff_mean": None,
+            "return_1d_abs_diff_max": None,
+            "return_alignment_status": "warning",
+            "price_level_status": "warning",
+            "adjustment_diagnostic_status": "warning",
+            "suggested_action": "missing_massive_sample",
+            "boundary_rebase_factor": None,
+            "warning": warning,
+        }
+
+    massive_rows = table_rows_between(massive_table, overlap_start_date, overlap_end_date)
+    source_by_date = {str(row["date"]): row for row in source_rows}
+    massive_by_date = {str(row["date"]): row for row in massive_rows}
+    joined_dates = sorted(set(source_by_date) & set(massive_by_date))
+
+    close_ratios: list[float] = []
+    close_pct_diffs: list[float] = []
+    close_ratio_start: float | None = None
+    close_ratio_end: float | None = None
+    for joined_date in joined_dates:
+        source_close = source_by_date[joined_date].get("close")
+        massive_close = massive_by_date[joined_date].get("close")
+        if source_close is None or massive_close is None:
+            continue
+        source_close_float = float(source_close)
+        massive_close_float = float(massive_close)
+        if source_close_float != 0:
+            ratio = massive_close_float / source_close_float
+            close_ratios.append(ratio)
+            if close_ratio_start is None:
+                close_ratio_start = ratio
+            close_ratio_end = ratio
+        if massive_close_float != 0:
+            close_pct_diffs.append(
+                abs(source_close_float - massive_close_float) / abs(massive_close_float)
+            )
+
+    source_returns = close_returns_by_date(source_rows)
+    massive_returns = close_returns_by_date(massive_rows)
+    return_abs_diffs: list[float] = []
+    for joined_date in joined_dates:
+        source_return = source_returns.get(joined_date)
+        massive_return = massive_returns.get(joined_date)
+        if source_return is None or massive_return is None:
+            continue
+        return_abs_diffs.append(abs(source_return - massive_return))
+
+    close_ratio_mean = metric_mean(close_ratios)
+    close_ratio_std = metric_std(close_ratios)
+    close_ratio_drift_abs = (
+        abs(close_ratio_end - close_ratio_start)
+        if close_ratio_start is not None and close_ratio_end is not None
+        else None
+    )
+    close_ratio_cv_value = ratio_cv(close_ratio_std, close_ratio_mean)
+    close_pct_diff_mean = metric_mean(close_pct_diffs)
+    close_pct_diff_max = metric_max(close_pct_diffs)
+    return_1d_abs_diff_mean = metric_mean(return_abs_diffs)
+    return_1d_abs_diff_max = metric_max(return_abs_diffs)
+
+    if not joined_dates:
+        warning = f"no joined overlap rows for {symbol}"
+        return_alignment_status = "warning"
+        price_level_status = "warning"
+        adjustment_diagnostic_status = "warning"
+        suggested_action = "inspect_source_quality"
+    else:
+        if (
+            return_1d_abs_diff_max is not None
+            and return_1d_abs_diff_max <= OVERLAP_RETURN_DIFF_FAIL_THRESHOLD
+        ):
+            return_alignment_status = "pass"
+        elif (
+            return_1d_abs_diff_mean is not None
+            and return_1d_abs_diff_mean <= RETURN_DIFF_WARNING_THRESHOLD
+        ):
+            return_alignment_status = "warning"
+        else:
+            return_alignment_status = "fail"
+
+        ratio_is_stable = (
+            close_ratio_cv_value is not None
+            and close_ratio_cv_value <= RATIO_CV_REBASE_CANDIDATE_THRESHOLD
+            and close_ratio_drift_abs is not None
+            and close_ratio_drift_abs <= RATIO_DRIFT_REBASE_CANDIDATE_THRESHOLD
+        )
+
+        if (
+            close_pct_diff_max is not None
+            and close_pct_diff_max <= OVERLAP_CLOSE_PCT_FAIL_THRESHOLD
+        ):
+            price_level_status = "pass"
+        elif (
+            close_pct_diff_max is not None
+            and ratio_is_stable
+            and return_alignment_status == "pass"
+        ):
+            price_level_status = "adjusted_level_mismatch"
+        else:
+            price_level_status = "fail"
+
+        if price_level_status == "pass" and return_alignment_status == "pass":
+            adjustment_diagnostic_status = "pass"
+            suggested_action = "use_as_is"
+        elif price_level_status == "adjusted_level_mismatch" and return_alignment_status == "pass":
+            adjustment_diagnostic_status = "rebase_candidate"
+            suggested_action = "rebase_pre_massive_history_before_promotion"
+        elif return_alignment_status == "warning":
+            adjustment_diagnostic_status = "warning"
+            suggested_action = "inspect_source_quality"
+        else:
+            adjustment_diagnostic_status = "fail"
+            suggested_action = "inspect_source_quality"
+
+    return {
+        "symbol": symbol,
+        "source_provider": source_provider,
+        "overlap_start": overlap_start_date,
+        "overlap_end": overlap_end_date,
+        "joined_rows": len(joined_dates),
+        "close_ratio_mean": close_ratio_mean,
+        "close_ratio_median": metric_median(close_ratios),
+        "close_ratio_std": close_ratio_std,
+        "close_ratio_min": metric_min(close_ratios),
+        "close_ratio_max": metric_max(close_ratios),
+        "close_ratio_start": close_ratio_start,
+        "close_ratio_end": close_ratio_end,
+        "close_ratio_drift_abs": close_ratio_drift_abs,
+        "close_ratio_cv": close_ratio_cv_value,
+        "close_pct_diff_mean": close_pct_diff_mean,
+        "close_pct_diff_max": close_pct_diff_max,
+        "return_1d_abs_diff_mean": return_1d_abs_diff_mean,
+        "return_1d_abs_diff_max": return_1d_abs_diff_max,
+        "return_alignment_status": return_alignment_status,
+        "price_level_status": price_level_status,
+        "adjustment_diagnostic_status": adjustment_diagnostic_status,
+        "suggested_action": suggested_action,
+        "boundary_rebase_factor": close_ratio_start,
+        "warning": warning,
+    }
 
 
 def build_overlap_row(
@@ -655,16 +851,27 @@ def build_coverage_row(
     }
 
 
-def build_symbol_quality_row(result: SymbolResult, overlap_status: str) -> dict[str, Any]:
-    quality_status = result.quality_status
-    if overlap_status == "fail":
+def build_symbol_quality_row(
+    result: SymbolResult,
+    overlap_status: str,
+    adjustment_diagnostic_status: str,
+    suggested_action: str,
+) -> dict[str, Any]:
+    if result.quality_status == "fail" or adjustment_diagnostic_status == "fail":
         quality_status = "fail"
-    elif quality_status == "pass" and overlap_status == "warning":
+    elif (
+        overlap_status in {"fail", "warning"}
+        or adjustment_diagnostic_status in {"rebase_candidate", "warning"}
+    ):
         quality_status = "warning"
+    else:
+        quality_status = "pass"
 
     issues = list(result.issues)
     if overlap_status != "pass":
         issues.append(f"overlap validation status: {overlap_status}")
+    if adjustment_diagnostic_status not in {"pass", ""}:
+        issues.append(f"adjustment diagnostic status: {adjustment_diagnostic_status}")
 
     return {
         "symbol": result.symbol,
@@ -680,6 +887,8 @@ def build_symbol_quality_row(result: SymbolResult, overlap_status: str) -> dict[
             else ""
         ),
         "overlap_quality_status": overlap_status,
+        "adjustment_diagnostic_status": adjustment_diagnostic_status,
+        "suggested_action": suggested_action,
     }
 
 
@@ -733,6 +942,7 @@ def write_markdown_summary(
     backfill_end_date: str,
     coverage_rows: list[dict[str, Any]],
     overlap_rows: list[dict[str, Any]],
+    adjustment_diagnostics_rows: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
     warnings: list[str],
     dry_run: bool,
@@ -747,6 +957,31 @@ def write_markdown_summary(
     overlap_pass = sum(1 for row in overlap_rows if row["overlap_quality_status"] == "pass")
     overlap_warning = sum(1 for row in overlap_rows if row["overlap_quality_status"] == "warning")
     overlap_fail = sum(1 for row in overlap_rows if row["overlap_quality_status"] == "fail")
+    adjustment_pass = sum(
+        1
+        for row in adjustment_diagnostics_rows
+        if row["adjustment_diagnostic_status"] == "pass"
+    )
+    adjustment_rebase = sum(
+        1
+        for row in adjustment_diagnostics_rows
+        if row["adjustment_diagnostic_status"] == "rebase_candidate"
+    )
+    adjustment_warning = sum(
+        1
+        for row in adjustment_diagnostics_rows
+        if row["adjustment_diagnostic_status"] == "warning"
+    )
+    adjustment_fail = sum(
+        1
+        for row in adjustment_diagnostics_rows
+        if row["adjustment_diagnostic_status"] == "fail"
+    )
+    rebase_candidates = [
+        str(row["symbol"])
+        for row in adjustment_diagnostics_rows
+        if row["adjustment_diagnostic_status"] == "rebase_candidate"
+    ]
     total_event_rows = sum(int(row["event_row_count"]) for row in event_rows)
     event_symbol_count = sum(1 for row in event_rows if int(row["event_row_count"]) > 0)
 
@@ -785,6 +1020,23 @@ def write_markdown_summary(
             "- Overlap statuses: "
             f"pass={overlap_pass}, warning={overlap_warning}, fail={overlap_fail}",
             "",
+            "## Adjustment Diagnostics Summary",
+            "- Adjustment diagnostic statuses: "
+            f"pass={adjustment_pass}, rebase_candidate={adjustment_rebase}, "
+            f"warning={adjustment_warning}, fail={adjustment_fail}",
+            "- Rebase candidates: "
+            f"{', '.join(rebase_candidates) if rebase_candidates else 'None.'}",
+            (
+                "- Large price-level differences with aligned one-day returns usually indicate "
+                "an adjusted/unadjusted or source adjustment convention mismatch, not "
+                "necessarily unusable source data."
+            ),
+            "- No rebasing is performed by this validator run.",
+            (
+                "- Next step: inspect `validation/adjustment_diagnostics_report.csv` before "
+                "deciding whether to implement a pre-Massive rebased export."
+            ),
+            "",
             "## Event Row Summary",
             f"- Event rows quarantined: {total_event_rows} across {event_symbol_count} symbols",
             (
@@ -817,13 +1069,22 @@ def write_markdown_summary(
 def normalize_quality_statuses(
     results: list[SymbolResult],
     overlap_rows: list[dict[str, Any]],
+    adjustment_diagnostics_rows: list[dict[str, Any]],
 ) -> None:
     overlap_by_symbol = {row["symbol"]: row["overlap_quality_status"] for row in overlap_rows}
+    adjustment_by_symbol = {
+        row["symbol"]: row["adjustment_diagnostic_status"]
+        for row in adjustment_diagnostics_rows
+    }
     for result in results:
         overlap_status = overlap_by_symbol.get(result.symbol, "warning")
-        if overlap_status == "fail":
+        adjustment_status = adjustment_by_symbol.get(result.symbol, "warning")
+        if result.quality_status == "fail" or adjustment_status == "fail":
             result.quality_status = "fail"
-        elif result.quality_status == "pass" and overlap_status == "warning":
+        elif result.quality_status == "pass" and (
+            overlap_status in {"fail", "warning"}
+            or adjustment_status in {"rebase_candidate", "warning"}
+        ):
             result.quality_status = "warning"
 
 
@@ -857,6 +1118,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         warnings.extend(f"{symbol}: {issue}" for issue in result.issues if "missing" in issue)
 
     overlap_rows: list[dict[str, Any]] = []
+    adjustment_diagnostics_rows: list[dict[str, Any]] = []
     for result in results:
         massive_table = load_massive_curated_symbol_table(massive_curated_dir, result.symbol)
         overlap_row = build_overlap_row(
@@ -867,10 +1129,24 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             overlap_end_date=overlap_end_date,
         )
         overlap_rows.append(overlap_row)
+        adjustment_diagnostics_row = build_adjustment_diagnostics_row(
+            symbol=result.symbol,
+            source_provider=source_provider,
+            source_table=result.table,
+            massive_table=massive_table,
+            overlap_start_date=overlap_start_date,
+            overlap_end_date=overlap_end_date,
+        )
+        adjustment_diagnostics_rows.append(adjustment_diagnostics_row)
         if overlap_row.get("warning"):
             warnings.append(f"{result.symbol}: {overlap_row['warning']}")
+        if (
+            adjustment_diagnostics_row.get("warning")
+            and adjustment_diagnostics_row.get("warning") != overlap_row.get("warning")
+        ):
+            warnings.append(f"{result.symbol}: {adjustment_diagnostics_row['warning']}")
 
-    normalize_quality_statuses(results, overlap_rows)
+    normalize_quality_statuses(results, overlap_rows, adjustment_diagnostics_rows)
 
     coverage_rows = [
         build_coverage_row(
@@ -885,8 +1161,20 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     overlap_status_by_symbol = {
         row["symbol"]: row["overlap_quality_status"] for row in overlap_rows
     }
+    adjustment_by_symbol = {
+        row["symbol"]: row for row in adjustment_diagnostics_rows
+    }
     symbol_quality_rows = [
-        build_symbol_quality_row(result, overlap_status_by_symbol.get(result.symbol, "warning"))
+        build_symbol_quality_row(
+            result,
+            overlap_status_by_symbol.get(result.symbol, "warning"),
+            adjustment_by_symbol.get(result.symbol, {}).get(
+                "adjustment_diagnostic_status", "warning"
+            ),
+            adjustment_by_symbol.get(result.symbol, {}).get(
+                "suggested_action", "inspect_source_quality"
+            ),
+        )
         for result in results
     ]
     event_report_rows = [
@@ -914,6 +1202,9 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     report_paths = {
         "coverage": str(validation_dir / REPORT_FILENAMES["coverage"]),
         "overlap": str(validation_dir / REPORT_FILENAMES["overlap"]),
+        "adjustment_diagnostics": str(
+            validation_dir / REPORT_FILENAMES["adjustment_diagnostics"]
+        ),
         "event_rows": str(validation_dir / REPORT_FILENAMES["event_rows"]),
         "symbol_quality": str(validation_dir / REPORT_FILENAMES["symbol_quality"]),
         "manifest": str(validation_dir / REPORT_FILENAMES["manifest"]),
@@ -975,6 +1266,36 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         ],
     )
     write_csv_report(
+        validation_dir / REPORT_FILENAMES["adjustment_diagnostics"],
+        adjustment_diagnostics_rows,
+        [
+            "symbol",
+            "source_provider",
+            "overlap_start",
+            "overlap_end",
+            "joined_rows",
+            "close_ratio_mean",
+            "close_ratio_median",
+            "close_ratio_std",
+            "close_ratio_min",
+            "close_ratio_max",
+            "close_ratio_start",
+            "close_ratio_end",
+            "close_ratio_drift_abs",
+            "close_ratio_cv",
+            "close_pct_diff_mean",
+            "close_pct_diff_max",
+            "return_1d_abs_diff_mean",
+            "return_1d_abs_diff_max",
+            "return_alignment_status",
+            "price_level_status",
+            "adjustment_diagnostic_status",
+            "suggested_action",
+            "boundary_rebase_factor",
+            "warning",
+        ],
+    )
+    write_csv_report(
         validation_dir / REPORT_FILENAMES["event_rows"],
         event_report_rows,
         [
@@ -1001,6 +1322,8 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             "event_row_count",
             "event_warning",
             "overlap_quality_status",
+            "adjustment_diagnostic_status",
+            "suggested_action",
         ],
     )
     write_json(validation_dir / REPORT_FILENAMES["manifest"], manifest)
@@ -1011,6 +1334,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         backfill_end_date=backfill_end_date,
         coverage_rows=coverage_rows,
         overlap_rows=overlap_rows,
+        adjustment_diagnostics_rows=adjustment_diagnostics_rows,
         event_rows=event_report_rows,
         warnings=warnings,
         dry_run=bool(args.dry_run),
@@ -1019,6 +1343,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     return ValidationRunResult(
         coverage_rows=coverage_rows,
         overlap_rows=overlap_rows,
+        adjustment_diagnostics_rows=adjustment_diagnostics_rows,
         event_rows=event_report_rows,
         symbol_quality_rows=symbol_quality_rows,
         manifest=manifest,
