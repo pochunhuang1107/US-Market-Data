@@ -1,0 +1,297 @@
+from __future__ import annotations
+# ruff: noqa: E402,I001
+
+import csv
+import sys
+from argparse import Namespace
+from pathlib import Path
+
+import pyarrow.parquet as pq
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from scripts import validate_manual_historical_etf_backfill as validator  # noqa: E402
+
+
+def write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    fieldnames: list[str] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = fieldnames or list(rows[0])
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_symbols(path: Path, symbols: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+
+
+def args_for(
+    tmp_path: Path,
+    *,
+    raw_dir: Path,
+    massive_curated_dir: Path,
+    output_dir: Path,
+    symbols_file: Path,
+    dry_run: bool = False,
+) -> Namespace:
+    return Namespace(
+        raw_dir=str(raw_dir),
+        source_provider="stooq",
+        massive_curated_dir=str(massive_curated_dir),
+        output_dir=str(output_dir),
+        symbols_file=str(symbols_file),
+        backfill_end_date="2017-12-31",
+        overlap_start_date="2018-01-01",
+        overlap_end_date="2018-01-03",
+        start_date=None,
+        dry_run=dry_run,
+    )
+
+
+def sample_raw_rows() -> list[dict[str, object]]:
+    return [
+        {"Date": "2017-12-29", "Open": 100, "High": 103, "Low": 99, "Close": 102, "Volume": 10},
+        {"Date": "2018-01-02", "Open": 102, "High": 105, "Low": 101, "Close": 104, "Volume": 11},
+        {"Date": "2018-01-03", "Open": 104, "High": 106, "Low": 103, "Close": 105, "Volume": 12},
+    ]
+
+
+def write_massive_sample(root: Path, symbol: str, rows: list[dict[str, object]]) -> Path:
+    table = validator.rows_to_curated_table(rows)
+    year = rows[0]["year"]
+    path = root / f"symbol={symbol}" / f"year={year}" / "data.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, path)
+    return path
+
+
+def test_csv_normalization_accepts_common_title_case_columns(tmp_path: Path) -> None:
+    csv_path = tmp_path / "SPY.csv"
+    write_csv(csv_path, sample_raw_rows())
+
+    result = validator.normalize_csv_file(csv_path, symbol="spy")
+    rows = result.table.to_pylist()
+
+    assert result.quality_status == "pass"
+    assert result.table.schema == validator.CURATED_ETF_SCHEMA
+    assert rows[0] == {
+        "date": "2017-12-29",
+        "year": 2017,
+        "month": 12,
+        "symbol": "SPY",
+        "open": 100.0,
+        "high": 103.0,
+        "low": 99.0,
+        "close": 102.0,
+        "volume": 10.0,
+        "vwap": None,
+        "transactions": None,
+    }
+
+
+def test_duplicate_symbol_date_rows_are_removed_deterministically(tmp_path: Path) -> None:
+    csv_path = tmp_path / "SPY.csv"
+    write_csv(
+        csv_path,
+        [
+            {"date": "2017-01-03", "open": 11, "high": 12, "low": 10, "close": 11, "volume": 2},
+            {"date": "2017-01-03", "open": 99, "high": 100, "low": 98, "close": 99, "volume": 3},
+            {"date": "2017-01-04", "open": 12, "high": 13, "low": 11, "close": 12, "volume": 4},
+        ],
+    )
+
+    result = validator.normalize_csv_file(csv_path, symbol="SPY")
+    rows = result.table.to_pylist()
+
+    assert result.duplicate_rows_removed == 1
+    assert len(rows) == 2
+    assert rows[0]["date"] == "2017-01-03"
+    assert rows[0]["open"] == 11.0
+    assert result.quality_status == "warning"
+
+
+def test_ohlc_quality_failures_are_counted(tmp_path: Path) -> None:
+    csv_path = tmp_path / "SPY.csv"
+    write_csv(
+        csv_path,
+        [
+            {"date": "2017-01-03", "open": 10, "high": 9, "low": 8, "close": 10, "volume": 2},
+            {"date": "2017-01-04", "open": 10, "high": 11, "low": 9, "close": -1, "volume": 2},
+            {"date": "2017-01-05", "open": 10, "high": 11, "low": 9, "close": 10, "volume": -2},
+        ],
+    )
+
+    result = validator.normalize_csv_file(csv_path, symbol="SPY")
+
+    assert result.ohlc_bad_rows == 3
+    assert result.quality_status == "fail"
+    assert "OHLC sanity failures: 3" in result.issues
+
+
+def test_pre_massive_export_rule_and_partition_output(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 104.0,
+                "high": 106.0,
+                "low": 103.0,
+                "close": 105.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    export_path = (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+        / "symbol=SPY"
+        / "year=2017"
+        / "data.parquet"
+    )
+    assert export_path.exists()
+    exported_rows = pq.ParquetFile(export_path).read().to_pylist()
+    assert [row["date"] for row in exported_rows] == ["2017-12-29"]
+    assert not (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+        / "symbol=SPY"
+        / "year=2018"
+        / "data.parquet"
+    ).exists()
+    assert result.coverage_rows[0]["backfill_row_count"] == 1
+    assert result.coverage_rows[0]["exported_years"] == "2017"
+
+
+def test_overlap_comparison_against_synthetic_massive_curated_sample(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 104.0,
+                "high": 106.0,
+                "low": 103.0,
+                "close": 105.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    overlap = result.overlap_rows[0]
+    assert overlap["source_rows"] == 2
+    assert overlap["massive_rows"] == 2
+    assert overlap["joined_rows"] == 2
+    assert overlap["close_abs_diff_max"] == 0.0
+    assert overlap["close_pct_diff_max"] == 0.0
+    assert overlap["return_1d_abs_diff_max"] == 0.0
+    assert overlap["overlap_quality_status"] == "pass"
+
+
+def test_missing_massive_overlap_sample_warns_without_crashing(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            dry_run=True,
+        )
+    )
+
+    assert result.overlap_rows[0]["overlap_quality_status"] == "warning"
+    assert "missing local Massive curated sample for SPY" in result.overlap_rows[0]["warning"]
+    assert result.manifest["warning_count"] >= 1
+    assert (output_dir / "validation" / "overlap_report.csv").exists()
+    assert not (output_dir / "normalized" / "stooq" / "SPY.parquet").exists()
