@@ -46,6 +46,7 @@ def args_for(
     output_dir: Path,
     symbols_file: Path,
     dry_run: bool = False,
+    boundary_window_days: str = "2",
 ) -> Namespace:
     return Namespace(
         raw_dir=str(raw_dir),
@@ -56,6 +57,7 @@ def args_for(
         backfill_end_date="2017-12-31",
         overlap_start_date="2018-01-01",
         overlap_end_date="2018-01-03",
+        boundary_window_days=boundary_window_days,
         start_date=None,
         dry_run=dry_run,
     )
@@ -395,6 +397,19 @@ def test_overlap_comparison_against_synthetic_massive_curated_sample(tmp_path: P
     assert diagnostics["suggested_action"] == "use_as_is"
     assert diagnostics["boundary_rebase_factor"] == 1.0
     assert (output_dir / "validation" / "adjustment_diagnostics_report.csv").exists()
+    boundary = result.boundary_rebase_diagnostics_rows[0]
+    assert boundary["boundary_window_days"] == 2
+    assert boundary["boundary_rows"] == 2
+    assert boundary["boundary_rebase_factor"] == 1.0
+    assert boundary["boundary_return_alignment_status"] == "pass"
+    assert boundary["boundary_ratio_stability_status"] == "pass"
+    assert boundary["boundary_rebase_status"] == "pass_no_rebase_needed"
+    assert boundary["suggested_action"] == "use_as_is"
+    assert (output_dir / "validation" / "boundary_rebase_diagnostics_report.csv").exists()
+    assert (
+        result.manifest["report_paths"]["boundary_rebase_diagnostics"]
+        == str(output_dir / "validation" / "boundary_rebase_diagnostics_report.csv")
+    )
 
 
 def test_adjustment_diagnostics_rebase_candidate_for_stable_price_ratio(
@@ -459,6 +474,17 @@ def test_adjustment_diagnostics_rebase_candidate_for_stable_price_ratio(
     assert diagnostics["close_ratio_cv"] == 0.0
     assert diagnostics["close_ratio_drift_abs"] == 0.0
     assert diagnostics["boundary_rebase_factor"] == 2.0
+    boundary = result.boundary_rebase_diagnostics_rows[0]
+    assert boundary["boundary_rebase_factor"] == 2.0
+    assert boundary["boundary_close_ratio_cv"] == 0.0
+    assert boundary["boundary_close_ratio_drift_abs"] == 0.0
+    assert boundary["boundary_return_alignment_status"] == "pass"
+    assert boundary["boundary_ratio_stability_status"] == "pass"
+    assert boundary["boundary_rebase_status"] == "boundary_rebase_candidate"
+    assert (
+        boundary["suggested_action"]
+        == "rebase_pre_massive_history_before_promotion"
+    )
 
     quality_rows = read_csv_rows(
         output_dir / "validation" / "symbol_quality_report.csv"
@@ -466,6 +492,78 @@ def test_adjustment_diagnostics_rebase_candidate_for_stable_price_ratio(
     assert quality_rows[0]["adjustment_diagnostic_status"] == "rebase_candidate"
     assert (
         quality_rows[0]["suggested_action"]
+        == "rebase_pre_massive_history_before_promotion"
+    )
+    assert quality_rows[0]["boundary_rebase_status"] == "boundary_rebase_candidate"
+    assert quality_rows[0]["boundary_rebase_factor"] == "2.0"
+    assert (
+        quality_rows[0]["boundary_suggested_action"]
+        == "rebase_pre_massive_history_before_promotion"
+    )
+
+
+def test_boundary_rebase_candidate_when_stable_factor_is_not_near_one(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 103.02,
+                "high": 106.05,
+                "low": 102.01,
+                "close": 105.04,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 105.04,
+                "high": 107.06,
+                "low": 104.03,
+                "close": 106.05,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+        )
+    )
+
+    diagnostics = result.adjustment_diagnostics_rows[0]
+    boundary = result.boundary_rebase_diagnostics_rows[0]
+    assert result.overlap_rows[0]["overlap_quality_status"] == "pass"
+    assert diagnostics["adjustment_diagnostic_status"] == "pass"
+    assert boundary["boundary_rebase_factor"] == 1.01
+    assert boundary["boundary_return_alignment_status"] == "pass"
+    assert boundary["boundary_ratio_stability_status"] == "pass"
+    assert boundary["boundary_rebase_status"] == "boundary_rebase_candidate"
+    assert (
+        boundary["suggested_action"]
         == "rebase_pre_massive_history_before_promotion"
     )
 
@@ -524,6 +622,10 @@ def test_adjustment_diagnostics_fail_when_returns_do_not_align(tmp_path: Path) -
     assert diagnostics["return_alignment_status"] == "fail"
     assert diagnostics["adjustment_diagnostic_status"] == "fail"
     assert diagnostics["suggested_action"] == "inspect_source_quality"
+    boundary = result.boundary_rebase_diagnostics_rows[0]
+    assert boundary["boundary_return_alignment_status"] == "fail"
+    assert boundary["boundary_rebase_status"] == "fail"
+    assert boundary["suggested_action"] == "inspect_source_quality"
 
 
 def test_missing_massive_overlap_sample_warns_without_crashing(tmp_path: Path) -> None:
@@ -549,10 +651,79 @@ def test_missing_massive_overlap_sample_warns_without_crashing(tmp_path: Path) -
     assert "missing local Massive curated sample for SPY" in result.overlap_rows[0]["warning"]
     assert result.adjustment_diagnostics_rows[0]["adjustment_diagnostic_status"] == "warning"
     assert result.adjustment_diagnostics_rows[0]["suggested_action"] == "missing_massive_sample"
+    assert result.boundary_rebase_diagnostics_rows[0]["boundary_rebase_status"] == "warning"
+    assert result.boundary_rebase_diagnostics_rows[0]["suggested_action"] == "missing_massive_sample"
     assert result.manifest["warning_count"] >= 1
     assert (output_dir / "validation" / "overlap_report.csv").exists()
     assert (output_dir / "validation" / "adjustment_diagnostics_report.csv").exists()
+    assert (output_dir / "validation" / "boundary_rebase_diagnostics_report.csv").exists()
     assert not (output_dir / "normalized" / "stooq" / "SPY.parquet").exists()
+
+
+def test_boundary_diagnostics_warn_when_boundary_window_is_insufficient(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 104.0,
+                "high": 106.0,
+                "low": 103.0,
+                "close": 105.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            boundary_window_days="3",
+        )
+    )
+
+    boundary = result.boundary_rebase_diagnostics_rows[0]
+    assert boundary["boundary_window_days"] == 3
+    assert boundary["boundary_rows"] == 2
+    assert boundary["boundary_rebase_status"] == "warning"
+    assert boundary["suggested_action"] == "insufficient_boundary_rows"
+    assert "insufficient boundary rows" in boundary["warning"]
+
+
+def test_boundary_window_days_parsing() -> None:
+    assert validator.parse_boundary_window_days("20,60, 120") == [20, 60, 120]
+    assert validator.parse_boundary_window_days(None) == [20, 60, 120]
 
 
 def test_summary_markdown_includes_adjustment_diagnostics_section(tmp_path: Path) -> None:
@@ -560,8 +731,41 @@ def test_summary_markdown_includes_adjustment_diagnostics_section(tmp_path: Path
     massive_dir = tmp_path / "massive"
     output_dir = tmp_path / "out"
     symbols_file = tmp_path / "symbols.txt"
-    write_symbols(symbols_file, ["SPY"])
+    write_symbols(symbols_file, ["GLD", "SPY"])
+    write_csv(raw_dir / "GLD.csv", sample_raw_rows())
     write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "GLD",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "GLD",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            },
+            {
+                "date": "2018-01-03",
+                "year": 2018,
+                "month": 1,
+                "symbol": "GLD",
+                "open": 104.0,
+                "high": 106.0,
+                "low": 103.0,
+                "close": 105.0,
+                "volume": 12.0,
+                "vwap": None,
+                "transactions": None,
+            },
+        ],
+    )
     write_massive_sample(
         massive_dir,
         "SPY",
@@ -613,3 +817,9 @@ def test_summary_markdown_includes_adjustment_diagnostics_section(tmp_path: Path
     assert "Rebase candidates: SPY" in summary
     assert "Large price-level differences with aligned one-day returns" in summary
     assert "No rebasing is performed" in summary
+    assert "## Boundary Rebase Diagnostics Summary" in summary
+    assert "pass_no_rebase_needed=1" in summary
+    assert "boundary_rebase_candidate=1" in summary
+    assert "Boundary rebase candidates: SPY" in summary
+    assert "No rebasing was performed" in summary
+    assert "A later task can create a rebased pre-Massive export only for accepted symbols" in summary

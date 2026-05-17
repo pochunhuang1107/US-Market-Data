@@ -147,10 +147,12 @@ summarized in `validation/event_rows_report.csv`, and excluded from normalized a
 price parquet. If these events are needed later, handle them as a separate corporate-action/event
 dataset rather than mixing them into ETF price history.
 
-Overlap diagnostics also write `validation/adjustment_diagnostics_report.csv`. This report compares
-Massive/source close ratios and one-day return differences so stable price-level mismatches can be
-flagged as possible adjustment convention differences. The validator only diagnoses these cases; it
-does not rebase prices or change the curated-style export.
+Overlap diagnostics also write `validation/adjustment_diagnostics_report.csv` and
+`validation/boundary_rebase_diagnostics_report.csv`. These reports compare Massive/source close
+ratios and one-day return differences so stable price-level mismatches can be flagged as possible
+adjustment convention differences. Boundary diagnostics focus on the first joined overlap trading
+days because Stooq is intended only for pre-Massive historical backfill. The validator only
+diagnoses these cases; it does not rebase prices or change the curated-style export.
 
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
@@ -164,7 +166,8 @@ python scripts/validate_manual_historical_etf_backfill.py \
   --symbols-file config/etf_symbols.example.txt \
   --backfill-end-date 2017-12-31 \
   --overlap-start-date 2018-01-01 \
-  --overlap-end-date 2026-05-08
+  --overlap-end-date 2026-05-08 \
+  --boundary-window-days 20,60,120
 ```
 
 ### 5. Manually ingest ApeWisdom Reddit trends

@@ -43,6 +43,7 @@ REPORT_FILENAMES = {
     "coverage": "coverage_report.csv",
     "overlap": "overlap_report.csv",
     "adjustment_diagnostics": "adjustment_diagnostics_report.csv",
+    "boundary_rebase_diagnostics": "boundary_rebase_diagnostics_report.csv",
     "event_rows": "event_rows_report.csv",
     "symbol_quality": "symbol_quality_report.csv",
     "manifest": "backfill_manifest.json",
@@ -54,6 +55,12 @@ OVERLAP_RETURN_DIFF_FAIL_THRESHOLD = 0.05
 RATIO_CV_REBASE_CANDIDATE_THRESHOLD = 0.01
 RATIO_DRIFT_REBASE_CANDIDATE_THRESHOLD = 0.03
 RETURN_DIFF_WARNING_THRESHOLD = 0.005
+BOUNDARY_WINDOW_DAYS_DEFAULT = "20,60,120"
+BOUNDARY_RATIO_CV_PASS_THRESHOLD = 0.005
+BOUNDARY_RATIO_CV_WARNING_THRESHOLD = 0.02
+BOUNDARY_RATIO_DRIFT_PASS_THRESHOLD = 0.01
+BOUNDARY_RATIO_DRIFT_WARNING_THRESHOLD = 0.03
+BOUNDARY_FACTOR_NEAR_ONE_THRESHOLD = 0.005
 PRICE_COLUMN_NAMES = {
     "date",
     "open",
@@ -95,6 +102,7 @@ class ValidationRunResult:
     coverage_rows: list[dict[str, Any]]
     overlap_rows: list[dict[str, Any]]
     adjustment_diagnostics_rows: list[dict[str, Any]]
+    boundary_rebase_diagnostics_rows: list[dict[str, Any]]
     event_rows: list[dict[str, Any]]
     symbol_quality_rows: list[dict[str, Any]]
     manifest: dict[str, Any]
@@ -118,6 +126,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backfill-end-date", default="2017-12-31")
     parser.add_argument("--overlap-start-date", default="2018-01-01")
     parser.add_argument("--overlap-end-date", default="2026-05-08")
+    parser.add_argument(
+        "--boundary-window-days",
+        default=BOUNDARY_WINDOW_DAYS_DEFAULT,
+        help="Comma-separated joined-overlap trading-day windows for boundary diagnostics.",
+    )
     parser.add_argument("--start-date")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -151,6 +164,29 @@ def validate_date_arg(value: str | None, name: str) -> str | None:
         return date.fromisoformat(value).isoformat()
     except ValueError as exc:
         raise SystemExit(f"{name} must be YYYY-MM-DD: {value}") from exc
+
+
+def parse_boundary_window_days(value: str | None) -> list[int]:
+    text = (value or BOUNDARY_WINDOW_DAYS_DEFAULT).strip()
+    if not text:
+        raise SystemExit("--boundary-window-days must include at least one positive integer")
+    window_days: list[int] = []
+    for item in text.split(","):
+        stripped = item.strip()
+        if not stripped:
+            raise SystemExit("--boundary-window-days contains an empty value")
+        try:
+            window = int(stripped)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--boundary-window-days values must be positive integers: {stripped}"
+            ) from exc
+        if window <= 0:
+            raise SystemExit(
+                f"--boundary-window-days values must be positive integers: {stripped}"
+            )
+        window_days.append(window)
+    return window_days
 
 
 def parse_date_value(value: object) -> str | None:
@@ -716,6 +752,208 @@ def build_adjustment_diagnostics_row(
     }
 
 
+def classify_boundary_return_alignment(return_1d_abs_diff_max: float | None) -> str:
+    if return_1d_abs_diff_max is None:
+        return "warning"
+    if return_1d_abs_diff_max <= RETURN_DIFF_WARNING_THRESHOLD:
+        return "pass"
+    if return_1d_abs_diff_max <= OVERLAP_RETURN_DIFF_FAIL_THRESHOLD:
+        return "warning"
+    return "fail"
+
+
+def classify_boundary_ratio_stability(
+    close_ratio_cv_value: float | None,
+    close_ratio_drift_abs: float | None,
+) -> str:
+    if close_ratio_cv_value is None or close_ratio_drift_abs is None:
+        return "warning"
+    if (
+        close_ratio_cv_value <= BOUNDARY_RATIO_CV_PASS_THRESHOLD
+        and close_ratio_drift_abs <= BOUNDARY_RATIO_DRIFT_PASS_THRESHOLD
+    ):
+        return "pass"
+    if (
+        close_ratio_cv_value <= BOUNDARY_RATIO_CV_WARNING_THRESHOLD
+        and close_ratio_drift_abs <= BOUNDARY_RATIO_DRIFT_WARNING_THRESHOLD
+    ):
+        return "warning"
+    return "fail"
+
+
+def boundary_ratio_is_near_one(boundary_rebase_factor: float | None) -> bool:
+    if boundary_rebase_factor is None:
+        return False
+    return abs(boundary_rebase_factor - 1.0) <= BOUNDARY_FACTOR_NEAR_ONE_THRESHOLD
+
+
+def build_boundary_rebase_diagnostics_rows(
+    *,
+    symbol: str,
+    source_provider: str,
+    source_table: pa.Table,
+    massive_table: pa.Table | None,
+    overlap_start_date: str,
+    overlap_end_date: str,
+    boundary_window_days: list[int],
+    adjustment_diagnostics_row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    source_rows = table_rows_between(source_table, overlap_start_date, overlap_end_date)
+
+    if massive_table is None:
+        warning = f"missing local Massive curated sample for {symbol}"
+        return [
+            {
+                "symbol": symbol,
+                "source_provider": source_provider,
+                "overlap_start": overlap_start_date,
+                "overlap_end": overlap_end_date,
+                "joined_rows": 0,
+                "boundary_window_days": window_days,
+                "boundary_start_date": "",
+                "boundary_end_date": "",
+                "boundary_rows": 0,
+                "boundary_rebase_factor": None,
+                "boundary_close_ratio_mean": None,
+                "boundary_close_ratio_median": None,
+                "boundary_close_ratio_std": None,
+                "boundary_close_ratio_min": None,
+                "boundary_close_ratio_max": None,
+                "boundary_close_ratio_cv": None,
+                "boundary_close_ratio_drift_abs": None,
+                "boundary_return_1d_abs_diff_mean": None,
+                "boundary_return_1d_abs_diff_max": None,
+                "boundary_return_alignment_status": "warning",
+                "boundary_ratio_stability_status": "warning",
+                "boundary_rebase_status": "warning",
+                "suggested_action": "missing_massive_sample",
+                "warning": warning,
+            }
+            for window_days in boundary_window_days
+        ]
+
+    massive_rows = table_rows_between(massive_table, overlap_start_date, overlap_end_date)
+    source_by_date = {str(row["date"]): row for row in source_rows}
+    massive_by_date = {str(row["date"]): row for row in massive_rows}
+    joined_dates = sorted(set(source_by_date) & set(massive_by_date))
+    source_returns = close_returns_by_date(source_rows)
+    massive_returns = close_returns_by_date(massive_rows)
+
+    rows: list[dict[str, Any]] = []
+    for window_days in boundary_window_days:
+        boundary_dates = joined_dates[:window_days]
+        close_ratios: list[float] = []
+        boundary_rebase_factor: float | None = None
+        for joined_date in boundary_dates:
+            source_close = source_by_date[joined_date].get("close")
+            massive_close = massive_by_date[joined_date].get("close")
+            if source_close is None or massive_close is None:
+                continue
+            source_close_float = float(source_close)
+            if source_close_float == 0:
+                continue
+            ratio = float(massive_close) / source_close_float
+            close_ratios.append(ratio)
+            if boundary_rebase_factor is None:
+                boundary_rebase_factor = ratio
+
+        return_abs_diffs: list[float] = []
+        for joined_date in boundary_dates:
+            source_return = source_returns.get(joined_date)
+            massive_return = massive_returns.get(joined_date)
+            if source_return is None or massive_return is None:
+                continue
+            return_abs_diffs.append(abs(source_return - massive_return))
+
+        boundary_close_ratio_mean = metric_mean(close_ratios)
+        boundary_close_ratio_std = metric_std(close_ratios)
+        boundary_close_ratio_cv = ratio_cv(
+            boundary_close_ratio_std,
+            boundary_close_ratio_mean,
+        )
+        boundary_close_ratio_drift_abs = (
+            abs(close_ratios[-1] - close_ratios[0])
+            if len(close_ratios) >= 2
+            else 0.0 if len(close_ratios) == 1 else None
+        )
+        boundary_return_1d_abs_diff_mean = metric_mean(return_abs_diffs)
+        boundary_return_1d_abs_diff_max = metric_max(return_abs_diffs)
+        boundary_return_alignment_status = classify_boundary_return_alignment(
+            boundary_return_1d_abs_diff_max
+        )
+        boundary_ratio_stability_status = classify_boundary_ratio_stability(
+            boundary_close_ratio_cv,
+            boundary_close_ratio_drift_abs,
+        )
+
+        warning = ""
+        if not joined_dates:
+            boundary_rebase_status = "warning"
+            suggested_action = "insufficient_boundary_rows"
+            warning = f"no joined overlap rows for {symbol}"
+        elif len(boundary_dates) < window_days:
+            boundary_rebase_status = "warning"
+            suggested_action = "insufficient_boundary_rows"
+            warning = (
+                f"insufficient boundary rows for {window_days}-day window: "
+                f"{len(boundary_dates)}"
+            )
+        elif (
+            boundary_return_alignment_status == "pass"
+            and boundary_ratio_stability_status in {"pass", "warning"}
+            and boundary_ratio_is_near_one(boundary_rebase_factor)
+        ):
+            boundary_rebase_status = "pass_no_rebase_needed"
+            suggested_action = "use_as_is"
+        elif (
+            boundary_return_alignment_status in {"pass", "warning"}
+            and boundary_ratio_stability_status in {"pass", "warning"}
+            and not boundary_ratio_is_near_one(boundary_rebase_factor)
+        ):
+            boundary_rebase_status = "boundary_rebase_candidate"
+            suggested_action = "rebase_pre_massive_history_before_promotion"
+        elif (
+            boundary_return_alignment_status == "fail"
+            or boundary_ratio_stability_status == "fail"
+        ):
+            boundary_rebase_status = "fail"
+            suggested_action = "inspect_source_quality"
+        else:
+            boundary_rebase_status = "warning"
+            suggested_action = "inspect_source_quality"
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "source_provider": source_provider,
+                "overlap_start": overlap_start_date,
+                "overlap_end": overlap_end_date,
+                "joined_rows": len(joined_dates),
+                "boundary_window_days": window_days,
+                "boundary_start_date": boundary_dates[0] if boundary_dates else "",
+                "boundary_end_date": boundary_dates[-1] if boundary_dates else "",
+                "boundary_rows": len(boundary_dates),
+                "boundary_rebase_factor": boundary_rebase_factor,
+                "boundary_close_ratio_mean": boundary_close_ratio_mean,
+                "boundary_close_ratio_median": metric_median(close_ratios),
+                "boundary_close_ratio_std": boundary_close_ratio_std,
+                "boundary_close_ratio_min": metric_min(close_ratios),
+                "boundary_close_ratio_max": metric_max(close_ratios),
+                "boundary_close_ratio_cv": boundary_close_ratio_cv,
+                "boundary_close_ratio_drift_abs": boundary_close_ratio_drift_abs,
+                "boundary_return_1d_abs_diff_mean": boundary_return_1d_abs_diff_mean,
+                "boundary_return_1d_abs_diff_max": boundary_return_1d_abs_diff_max,
+                "boundary_return_alignment_status": boundary_return_alignment_status,
+                "boundary_ratio_stability_status": boundary_ratio_stability_status,
+                "boundary_rebase_status": boundary_rebase_status,
+                "suggested_action": suggested_action,
+                "warning": warning,
+            }
+        )
+
+    return rows
+
+
 def build_overlap_row(
     *,
     symbol: str,
@@ -856,12 +1094,20 @@ def build_symbol_quality_row(
     overlap_status: str,
     adjustment_diagnostic_status: str,
     suggested_action: str,
+    boundary_rebase_status: str,
+    boundary_rebase_factor: float | None,
+    boundary_suggested_action: str,
 ) -> dict[str, Any]:
-    if result.quality_status == "fail" or adjustment_diagnostic_status == "fail":
+    if (
+        result.quality_status == "fail"
+        or adjustment_diagnostic_status == "fail"
+        or boundary_rebase_status == "fail"
+    ):
         quality_status = "fail"
     elif (
         overlap_status in {"fail", "warning"}
         or adjustment_diagnostic_status in {"rebase_candidate", "warning"}
+        or boundary_rebase_status in {"boundary_rebase_candidate", "warning"}
     ):
         quality_status = "warning"
     else:
@@ -872,6 +1118,8 @@ def build_symbol_quality_row(
         issues.append(f"overlap validation status: {overlap_status}")
     if adjustment_diagnostic_status not in {"pass", ""}:
         issues.append(f"adjustment diagnostic status: {adjustment_diagnostic_status}")
+    if boundary_rebase_status not in {"pass_no_rebase_needed", ""}:
+        issues.append(f"boundary rebase status: {boundary_rebase_status}")
 
     return {
         "symbol": result.symbol,
@@ -889,6 +1137,9 @@ def build_symbol_quality_row(
         "overlap_quality_status": overlap_status,
         "adjustment_diagnostic_status": adjustment_diagnostic_status,
         "suggested_action": suggested_action,
+        "boundary_rebase_status": boundary_rebase_status,
+        "boundary_rebase_factor": boundary_rebase_factor,
+        "boundary_suggested_action": boundary_suggested_action,
     }
 
 
@@ -943,6 +1194,7 @@ def write_markdown_summary(
     coverage_rows: list[dict[str, Any]],
     overlap_rows: list[dict[str, Any]],
     adjustment_diagnostics_rows: list[dict[str, Any]],
+    boundary_rebase_diagnostics_rows: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
     warnings: list[str],
     dry_run: bool,
@@ -982,6 +1234,33 @@ def write_markdown_summary(
         for row in adjustment_diagnostics_rows
         if row["adjustment_diagnostic_status"] == "rebase_candidate"
     ]
+    boundary_pass = sum(
+        1
+        for row in boundary_rebase_diagnostics_rows
+        if row["boundary_rebase_status"] == "pass_no_rebase_needed"
+    )
+    boundary_rebase = sum(
+        1
+        for row in boundary_rebase_diagnostics_rows
+        if row["boundary_rebase_status"] == "boundary_rebase_candidate"
+    )
+    boundary_warning = sum(
+        1
+        for row in boundary_rebase_diagnostics_rows
+        if row["boundary_rebase_status"] == "warning"
+    )
+    boundary_fail = sum(
+        1
+        for row in boundary_rebase_diagnostics_rows
+        if row["boundary_rebase_status"] == "fail"
+    )
+    boundary_rebase_candidates = sorted(
+        {
+            str(row["symbol"])
+            for row in boundary_rebase_diagnostics_rows
+            if row["boundary_rebase_status"] == "boundary_rebase_candidate"
+        }
+    )
     total_event_rows = sum(int(row["event_row_count"]) for row in event_rows)
     event_symbol_count = sum(1 for row in event_rows if int(row["event_row_count"]) > 0)
 
@@ -1035,6 +1314,19 @@ def write_markdown_summary(
             (
                 "- Next step: inspect `validation/adjustment_diagnostics_report.csv` before "
                 "deciding whether to implement a pre-Massive rebased export."
+            ),
+            "",
+            "## Boundary Rebase Diagnostics Summary",
+            "- Boundary rebase statuses: "
+            f"pass_no_rebase_needed={boundary_pass}, "
+            f"boundary_rebase_candidate={boundary_rebase}, "
+            f"warning={boundary_warning}, fail={boundary_fail}",
+            "- Boundary rebase candidates: "
+            f"{', '.join(boundary_rebase_candidates) if boundary_rebase_candidates else 'None.'}",
+            "- No rebasing was performed by this validator run.",
+            (
+                "- A later task can create a rebased pre-Massive export only for accepted "
+                "symbols."
             ),
             "",
             "## Event Row Summary",
@@ -1097,6 +1389,9 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     overlap_start_date = validate_date_arg(args.overlap_start_date, "--overlap-start-date")
     overlap_end_date = validate_date_arg(args.overlap_end_date, "--overlap-end-date")
     start_date = validate_date_arg(args.start_date, "--start-date")
+    boundary_window_days = parse_boundary_window_days(
+        getattr(args, "boundary_window_days", BOUNDARY_WINDOW_DAYS_DEFAULT)
+    )
     assert backfill_end_date is not None
     assert overlap_start_date is not None
     assert overlap_end_date is not None
@@ -1119,6 +1414,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
 
     overlap_rows: list[dict[str, Any]] = []
     adjustment_diagnostics_rows: list[dict[str, Any]] = []
+    boundary_rebase_diagnostics_rows: list[dict[str, Any]] = []
     for result in results:
         massive_table = load_massive_curated_symbol_table(massive_curated_dir, result.symbol)
         overlap_row = build_overlap_row(
@@ -1138,6 +1434,17 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             overlap_end_date=overlap_end_date,
         )
         adjustment_diagnostics_rows.append(adjustment_diagnostics_row)
+        boundary_rows = build_boundary_rebase_diagnostics_rows(
+            symbol=result.symbol,
+            source_provider=source_provider,
+            source_table=result.table,
+            massive_table=massive_table,
+            overlap_start_date=overlap_start_date,
+            overlap_end_date=overlap_end_date,
+            boundary_window_days=boundary_window_days,
+            adjustment_diagnostics_row=adjustment_diagnostics_row,
+        )
+        boundary_rebase_diagnostics_rows.extend(boundary_rows)
         if overlap_row.get("warning"):
             warnings.append(f"{result.symbol}: {overlap_row['warning']}")
         if (
@@ -1145,6 +1452,11 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             and adjustment_diagnostics_row.get("warning") != overlap_row.get("warning")
         ):
             warnings.append(f"{result.symbol}: {adjustment_diagnostics_row['warning']}")
+        for boundary_row in boundary_rows:
+            if boundary_row.get("warning"):
+                warning = f"{result.symbol}: {boundary_row['warning']}"
+                if warning not in warnings:
+                    warnings.append(warning)
 
     normalize_quality_statuses(results, overlap_rows, adjustment_diagnostics_rows)
 
@@ -1164,6 +1476,9 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     adjustment_by_symbol = {
         row["symbol"]: row for row in adjustment_diagnostics_rows
     }
+    primary_boundary_by_symbol = {}
+    for row in boundary_rebase_diagnostics_rows:
+        primary_boundary_by_symbol.setdefault(row["symbol"], row)
     symbol_quality_rows = [
         build_symbol_quality_row(
             result,
@@ -1172,6 +1487,15 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
                 "adjustment_diagnostic_status", "warning"
             ),
             adjustment_by_symbol.get(result.symbol, {}).get(
+                "suggested_action", "inspect_source_quality"
+            ),
+            primary_boundary_by_symbol.get(result.symbol, {}).get(
+                "boundary_rebase_status", "warning"
+            ),
+            primary_boundary_by_symbol.get(result.symbol, {}).get(
+                "boundary_rebase_factor"
+            ),
+            primary_boundary_by_symbol.get(result.symbol, {}).get(
                 "suggested_action", "inspect_source_quality"
             ),
         )
@@ -1205,6 +1529,9 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         "adjustment_diagnostics": str(
             validation_dir / REPORT_FILENAMES["adjustment_diagnostics"]
         ),
+        "boundary_rebase_diagnostics": str(
+            validation_dir / REPORT_FILENAMES["boundary_rebase_diagnostics"]
+        ),
         "event_rows": str(validation_dir / REPORT_FILENAMES["event_rows"]),
         "symbol_quality": str(validation_dir / REPORT_FILENAMES["symbol_quality"]),
         "manifest": str(validation_dir / REPORT_FILENAMES["manifest"]),
@@ -1220,6 +1547,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         "backfill_end_date": backfill_end_date,
         "overlap_start_date": overlap_start_date,
         "overlap_end_date": overlap_end_date,
+        "boundary_window_days": boundary_window_days,
         "symbols": symbols,
         "export_path": str(export_path),
         "report_paths": report_paths,
@@ -1296,6 +1624,36 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         ],
     )
     write_csv_report(
+        validation_dir / REPORT_FILENAMES["boundary_rebase_diagnostics"],
+        boundary_rebase_diagnostics_rows,
+        [
+            "symbol",
+            "source_provider",
+            "overlap_start",
+            "overlap_end",
+            "joined_rows",
+            "boundary_window_days",
+            "boundary_start_date",
+            "boundary_end_date",
+            "boundary_rows",
+            "boundary_rebase_factor",
+            "boundary_close_ratio_mean",
+            "boundary_close_ratio_median",
+            "boundary_close_ratio_std",
+            "boundary_close_ratio_min",
+            "boundary_close_ratio_max",
+            "boundary_close_ratio_cv",
+            "boundary_close_ratio_drift_abs",
+            "boundary_return_1d_abs_diff_mean",
+            "boundary_return_1d_abs_diff_max",
+            "boundary_return_alignment_status",
+            "boundary_ratio_stability_status",
+            "boundary_rebase_status",
+            "suggested_action",
+            "warning",
+        ],
+    )
+    write_csv_report(
         validation_dir / REPORT_FILENAMES["event_rows"],
         event_report_rows,
         [
@@ -1324,6 +1682,9 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             "overlap_quality_status",
             "adjustment_diagnostic_status",
             "suggested_action",
+            "boundary_rebase_status",
+            "boundary_rebase_factor",
+            "boundary_suggested_action",
         ],
     )
     write_json(validation_dir / REPORT_FILENAMES["manifest"], manifest)
@@ -1335,6 +1696,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         coverage_rows=coverage_rows,
         overlap_rows=overlap_rows,
         adjustment_diagnostics_rows=adjustment_diagnostics_rows,
+        boundary_rebase_diagnostics_rows=boundary_rebase_diagnostics_rows,
         event_rows=event_report_rows,
         warnings=warnings,
         dry_run=bool(args.dry_run),
@@ -1344,6 +1706,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         coverage_rows=coverage_rows,
         overlap_rows=overlap_rows,
         adjustment_diagnostics_rows=adjustment_diagnostics_rows,
+        boundary_rebase_diagnostics_rows=boundary_rebase_diagnostics_rows,
         event_rows=event_report_rows,
         symbol_quality_rows=symbol_quality_rows,
         manifest=manifest,
