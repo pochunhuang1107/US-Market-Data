@@ -154,6 +154,15 @@ adjustment convention differences. Boundary diagnostics focus on the first joine
 days because Stooq is intended only for pre-Massive historical backfill. The validator only
 diagnoses these cases; it does not rebase prices or change the curated-style export.
 
+By default, the validator preserves the historical fixed boundary behavior and exports rows with
+`date <= --backfill-end-date`. For safer local ETF backfill staging after downloading a Massive
+sample, use `--backfill-boundary-mode infer_from_massive`. In that mode the validator infers each
+symbol's local Massive first available date from `--massive-curated-dir` and exports only source
+rows before that symbol-specific date. Symbols without a local Massive sample export no source rows
+in `infer_from_massive` mode and are marked `missing_massive_sample` in
+`validation/massive_boundary_report.csv`; this avoids accidentally exporting all historical source
+rows.
+
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
 
@@ -164,6 +173,7 @@ python scripts/validate_manual_historical_etf_backfill.py \
   --massive-curated-dir data/manual_backfill/massive_curated_sample \
   --output-dir data/manual_backfill \
   --symbols-file config/etf_symbols.example.txt \
+  --backfill-boundary-mode infer_from_massive \
   --backfill-end-date 2017-12-31 \
   --overlap-start-date 2018-01-01 \
   --overlap-end-date 2026-05-08 \

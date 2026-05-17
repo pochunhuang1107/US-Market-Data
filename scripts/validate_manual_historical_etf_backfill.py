@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import sys
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Any, Iterable
@@ -44,6 +45,7 @@ REPORT_FILENAMES = {
     "overlap": "overlap_report.csv",
     "adjustment_diagnostics": "adjustment_diagnostics_report.csv",
     "boundary_rebase_diagnostics": "boundary_rebase_diagnostics_report.csv",
+    "massive_boundary": "massive_boundary_report.csv",
     "event_rows": "event_rows_report.csv",
     "symbol_quality": "symbol_quality_report.csv",
     "manifest": "backfill_manifest.json",
@@ -103,6 +105,7 @@ class ValidationRunResult:
     overlap_rows: list[dict[str, Any]]
     adjustment_diagnostics_rows: list[dict[str, Any]]
     boundary_rebase_diagnostics_rows: list[dict[str, Any]]
+    massive_boundary_rows: list[dict[str, Any]]
     event_rows: list[dict[str, Any]]
     symbol_quality_rows: list[dict[str, Any]]
     manifest: dict[str, Any]
@@ -124,6 +127,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="data/manual_backfill")
     parser.add_argument("--symbols-file")
     parser.add_argument("--backfill-end-date", default="2017-12-31")
+    parser.add_argument(
+        "--backfill-boundary-mode",
+        choices=["fixed", "infer_from_massive"],
+        default="fixed",
+        help=(
+            "fixed keeps the global --backfill-end-date export rule; "
+            "infer_from_massive exports each symbol only before its local Massive first date."
+        ),
+    )
     parser.add_argument("--overlap-start-date", default="2018-01-01")
     parser.add_argument("--overlap-end-date", default="2026-05-08")
     parser.add_argument(
@@ -466,6 +478,19 @@ def table_rows_through(table: pa.Table, end_date: str) -> list[dict[str, Any]]:
     return [row for row in table.to_pylist() if row["date"] is not None and row["date"] <= end_date]
 
 
+def table_date_bounds(table: pa.Table | None) -> tuple[str, str]:
+    if table is None:
+        return "", ""
+    dates = [str(row["date"]) for row in table.to_pylist() if row["date"] is not None]
+    if not dates:
+        return "", ""
+    return min(dates), max(dates)
+
+
+def previous_calendar_day(value: str) -> str:
+    return (date.fromisoformat(value) - timedelta(days=1)).isoformat()
+
+
 def sort_table(table: pa.Table) -> pa.Table:
     if table.num_rows == 0:
         return table
@@ -518,6 +543,8 @@ def write_curated_export(
 ) -> list[Path]:
     written_paths: list[Path] = []
     export_root = output_dir / "curated_export" / f"source={source_provider}" / "etf_daily_prices"
+    if export_root.exists():
+        shutil.rmtree(export_root)
     for (symbol, year), group_rows in sorted(split_rows_by_symbol_year(rows).items()):
         relative_key = curated_key("", symbol, year).lstrip("/")
         path = export_root / relative_key
@@ -1060,32 +1087,111 @@ def build_coverage_row(
     result: SymbolResult,
     *,
     source_provider: str,
-    backfill_end_date: str,
+    massive_boundary_row: dict[str, Any],
     overlap_start_date: str,
     overlap_end_date: str,
 ) -> dict[str, Any]:
     rows = result.table.to_pylist()
     dates = [row["date"] for row in rows if row["date"] is not None]
-    backfill_rows = [
-        row for row in rows if row["date"] is not None and row["date"] <= backfill_end_date
-    ]
     overlap_rows = [
         row
         for row in rows
         if row["date"] is not None and overlap_start_date <= row["date"] <= overlap_end_date
     ]
-    exported_years = sorted({str(row["year"]) for row in backfill_rows})
     return {
         "symbol": result.symbol,
         "source_provider": source_provider,
         "first_date": min(dates) if dates else "",
         "last_date": max(dates) if dates else "",
         "row_count": len(rows),
-        "backfill_row_count": len(backfill_rows),
+        "backfill_row_count": massive_boundary_row["export_row_count"],
         "overlap_row_count": len(overlap_rows),
-        "exported_years": ";".join(exported_years),
-        "has_pre_massive_history": bool(backfill_rows),
+        "exported_years": massive_boundary_row["exported_years"],
+        "has_pre_massive_history": massive_boundary_row["has_pre_massive_history"],
+        "massive_first_available_date": massive_boundary_row[
+            "massive_first_available_date"
+        ],
+        "source_backfill_end_date": massive_boundary_row["source_backfill_end_date"],
+        "backfill_boundary_mode": massive_boundary_row["backfill_boundary_mode"],
+        "requires_merge_with_existing_partition": massive_boundary_row[
+            "requires_merge_with_existing_partition"
+        ],
         "quality_status": result.quality_status,
+    }
+
+
+def build_massive_boundary_row(
+    *,
+    result: SymbolResult,
+    source_provider: str,
+    massive_table: pa.Table | None,
+    global_backfill_end_date: str,
+    backfill_boundary_mode: str,
+) -> dict[str, Any]:
+    source_first_date, source_last_date = table_date_bounds(result.table)
+    massive_first_available_date, massive_last_available_date = table_date_bounds(
+        massive_table
+    )
+    warning = ""
+
+    if backfill_boundary_mode == "infer_from_massive":
+        if massive_first_available_date:
+            source_backfill_end_date = previous_calendar_day(massive_first_available_date)
+            boundary_status = "inferred_from_massive"
+        else:
+            source_backfill_end_date = ""
+            boundary_status = "missing_massive_sample"
+            warning = (
+                "missing local Massive sample; infer_from_massive mode exports no "
+                "source rows for this symbol"
+            )
+    else:
+        source_backfill_end_date = global_backfill_end_date
+        boundary_status = "fixed_global_backfill_end_date"
+        if not massive_first_available_date:
+            warning = (
+                "missing local Massive sample; fixed mode still uses the global "
+                "backfill end date"
+            )
+
+    source_rows = result.table.to_pylist()
+    export_rows = (
+        [
+            row
+            for row in source_rows
+            if row["date"] is not None and row["date"] <= source_backfill_end_date
+        ]
+        if source_backfill_end_date
+        else []
+    )
+    export_dates = [str(row["date"]) for row in export_rows if row["date"] is not None]
+    exported_years = sorted({str(row["year"]) for row in export_rows})
+    requires_merge_with_existing_partition = False
+    if massive_first_available_date and source_backfill_end_date:
+        massive_first_year = date.fromisoformat(massive_first_available_date).year
+        requires_merge_with_existing_partition = (
+            date.fromisoformat(source_backfill_end_date).year == massive_first_year
+            and any(int(row["year"]) == massive_first_year for row in export_rows)
+        )
+
+    return {
+        "symbol": result.symbol,
+        "source_provider": source_provider,
+        "massive_first_available_date": massive_first_available_date,
+        "massive_last_available_date": massive_last_available_date,
+        "source_first_date": source_first_date,
+        "source_last_date": source_last_date,
+        "global_backfill_end_date": global_backfill_end_date,
+        "source_backfill_end_date": source_backfill_end_date,
+        "backfill_boundary_mode": backfill_boundary_mode,
+        "export_row_count": len(export_rows),
+        "exported_years": ";".join(exported_years),
+        "first_export_date": min(export_dates) if export_dates else "",
+        "last_export_date": max(export_dates) if export_dates else "",
+        "has_pre_massive_history": bool(export_rows),
+        "boundary_status": boundary_status,
+        "requires_merge_with_existing_partition": requires_merge_with_existing_partition,
+        "warning": warning,
     }
 
 
@@ -1195,6 +1301,7 @@ def write_markdown_summary(
     overlap_rows: list[dict[str, Any]],
     adjustment_diagnostics_rows: list[dict[str, Any]],
     boundary_rebase_diagnostics_rows: list[dict[str, Any]],
+    massive_boundary_rows: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
     warnings: list[str],
     dry_run: bool,
@@ -1261,6 +1368,29 @@ def write_markdown_summary(
             if row["boundary_rebase_status"] == "boundary_rebase_candidate"
         }
     )
+    backfill_boundary_mode = (
+        str(massive_boundary_rows[0]["backfill_boundary_mode"])
+        if massive_boundary_rows
+        else ""
+    )
+    massive_boundary_inferred = sum(
+        1
+        for row in massive_boundary_rows
+        if row["boundary_status"] == "inferred_from_massive"
+    )
+    massive_boundary_missing = sum(
+        1
+        for row in massive_boundary_rows
+        if row["boundary_status"] == "missing_massive_sample"
+    )
+    total_boundary_export_rows = sum(
+        int(row["export_row_count"]) for row in massive_boundary_rows
+    )
+    merge_required_symbols = sorted(
+        str(row["symbol"])
+        for row in massive_boundary_rows
+        if bool(row["requires_merge_with_existing_partition"])
+    )
     total_event_rows = sum(int(row["event_row_count"]) for row in event_rows)
     event_symbol_count = sum(1 for row in event_rows if int(row["event_row_count"]) > 0)
 
@@ -1280,7 +1410,7 @@ def write_markdown_summary(
         ),
         "- No S3 write happened during this run.",
         (
-            f"- Exported curated-style files contain only rows with `date <= {backfill_end_date}`."
+            f"- Global backfill end date: `{backfill_end_date}`."
         ),
     ]
     if dry_run:
@@ -1328,6 +1458,22 @@ def write_markdown_summary(
                 "- A later task can create a rebased pre-Massive export only for accepted "
                 "symbols."
             ),
+            "",
+            "## Massive Boundary Export Summary",
+            f"- Boundary mode: `{backfill_boundary_mode}`",
+            f"- Symbols with Massive boundary inferred: {massive_boundary_inferred}",
+            f"- Symbols missing Massive sample: {massive_boundary_missing}",
+            (
+                "- Total export rows under selected boundary mode: "
+                f"{total_boundary_export_rows}"
+            ),
+            "- Symbols requiring same-year partition merge: "
+            f"{', '.join(merge_required_symbols) if merge_required_symbols else 'None.'}",
+            (
+                "- In infer_from_massive mode, exported rows are limited to dates before "
+                "each symbol's local Massive first available date."
+            ),
+            "- No rebasing and no S3 promotion happened in this task.",
             "",
             "## Event Row Summary",
             f"- Event rows quarantined: {total_event_rows} across {event_symbol_count} symbols",
@@ -1386,6 +1532,11 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     output_dir = Path(args.output_dir)
     source_provider = str(args.source_provider).strip()
     backfill_end_date = validate_date_arg(args.backfill_end_date, "--backfill-end-date")
+    backfill_boundary_mode = getattr(args, "backfill_boundary_mode", "fixed")
+    if backfill_boundary_mode not in {"fixed", "infer_from_massive"}:
+        raise SystemExit(
+            "--backfill-boundary-mode must be one of: fixed, infer_from_massive"
+        )
     overlap_start_date = validate_date_arg(args.overlap_start_date, "--overlap-start-date")
     overlap_end_date = validate_date_arg(args.overlap_end_date, "--overlap-end-date")
     start_date = validate_date_arg(args.start_date, "--start-date")
@@ -1415,8 +1566,10 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
     overlap_rows: list[dict[str, Any]] = []
     adjustment_diagnostics_rows: list[dict[str, Any]] = []
     boundary_rebase_diagnostics_rows: list[dict[str, Any]] = []
+    massive_tables_by_symbol: dict[str, pa.Table | None] = {}
     for result in results:
         massive_table = load_massive_curated_symbol_table(massive_curated_dir, result.symbol)
+        massive_tables_by_symbol[result.symbol] = massive_table
         overlap_row = build_overlap_row(
             symbol=result.symbol,
             source_table=result.table,
@@ -1460,11 +1613,30 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
 
     normalize_quality_statuses(results, overlap_rows, adjustment_diagnostics_rows)
 
+    massive_boundary_rows = [
+        build_massive_boundary_row(
+            result=result,
+            source_provider=source_provider,
+            massive_table=massive_tables_by_symbol.get(result.symbol),
+            global_backfill_end_date=backfill_end_date,
+            backfill_boundary_mode=backfill_boundary_mode,
+        )
+        for result in results
+    ]
+    massive_boundary_by_symbol = {
+        row["symbol"]: row for row in massive_boundary_rows
+    }
+    for row in massive_boundary_rows:
+        if row.get("warning"):
+            warning = f"{row['symbol']}: {row['warning']}"
+            if warning not in warnings:
+                warnings.append(warning)
+
     coverage_rows = [
         build_coverage_row(
             result,
             source_provider=source_provider,
-            backfill_end_date=backfill_end_date,
+            massive_boundary_row=massive_boundary_by_symbol[result.symbol],
             overlap_start_date=overlap_start_date,
             overlap_end_date=overlap_end_date,
         )
@@ -1519,7 +1691,13 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         for result in results:
             if result.table.num_rows:
                 write_normalized_table(result.table, output_dir, source_provider, result.symbol)
-                all_backfill_rows.extend(table_rows_through(result.table, backfill_end_date))
+                source_backfill_end_date = massive_boundary_by_symbol[result.symbol][
+                    "source_backfill_end_date"
+                ]
+                if source_backfill_end_date:
+                    all_backfill_rows.extend(
+                        table_rows_through(result.table, source_backfill_end_date)
+                    )
         write_curated_export(all_backfill_rows, output_dir, source_provider)
 
     validation_dir = output_dir / "validation"
@@ -1532,6 +1710,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         "boundary_rebase_diagnostics": str(
             validation_dir / REPORT_FILENAMES["boundary_rebase_diagnostics"]
         ),
+        "massive_boundary": str(validation_dir / REPORT_FILENAMES["massive_boundary"]),
         "event_rows": str(validation_dir / REPORT_FILENAMES["event_rows"]),
         "symbol_quality": str(validation_dir / REPORT_FILENAMES["symbol_quality"]),
         "manifest": str(validation_dir / REPORT_FILENAMES["manifest"]),
@@ -1545,11 +1724,13 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         "massive_curated_dir": str(massive_curated_dir),
         "output_dir": str(output_dir),
         "backfill_end_date": backfill_end_date,
+        "backfill_boundary_mode": backfill_boundary_mode,
         "overlap_start_date": overlap_start_date,
         "overlap_end_date": overlap_end_date,
         "boundary_window_days": boundary_window_days,
         "symbols": symbols,
         "export_path": str(export_path),
+        "massive_boundary_report": report_paths["massive_boundary"],
         "report_paths": report_paths,
         "warning_count": len(warnings),
         "dry_run": bool(args.dry_run),
@@ -1568,6 +1749,10 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
             "overlap_row_count",
             "exported_years",
             "has_pre_massive_history",
+            "massive_first_available_date",
+            "source_backfill_end_date",
+            "backfill_boundary_mode",
+            "requires_merge_with_existing_partition",
             "quality_status",
         ],
     )
@@ -1654,6 +1839,29 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         ],
     )
     write_csv_report(
+        validation_dir / REPORT_FILENAMES["massive_boundary"],
+        massive_boundary_rows,
+        [
+            "symbol",
+            "source_provider",
+            "massive_first_available_date",
+            "massive_last_available_date",
+            "source_first_date",
+            "source_last_date",
+            "global_backfill_end_date",
+            "source_backfill_end_date",
+            "backfill_boundary_mode",
+            "export_row_count",
+            "exported_years",
+            "first_export_date",
+            "last_export_date",
+            "has_pre_massive_history",
+            "boundary_status",
+            "requires_merge_with_existing_partition",
+            "warning",
+        ],
+    )
+    write_csv_report(
         validation_dir / REPORT_FILENAMES["event_rows"],
         event_report_rows,
         [
@@ -1697,6 +1905,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         overlap_rows=overlap_rows,
         adjustment_diagnostics_rows=adjustment_diagnostics_rows,
         boundary_rebase_diagnostics_rows=boundary_rebase_diagnostics_rows,
+        massive_boundary_rows=massive_boundary_rows,
         event_rows=event_report_rows,
         warnings=warnings,
         dry_run=bool(args.dry_run),
@@ -1707,6 +1916,7 @@ def run_validation(args: argparse.Namespace) -> ValidationRunResult:
         overlap_rows=overlap_rows,
         adjustment_diagnostics_rows=adjustment_diagnostics_rows,
         boundary_rebase_diagnostics_rows=boundary_rebase_diagnostics_rows,
+        massive_boundary_rows=massive_boundary_rows,
         event_rows=event_report_rows,
         symbol_quality_rows=symbol_quality_rows,
         manifest=manifest,

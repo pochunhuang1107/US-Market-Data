@@ -231,6 +231,7 @@ def write_summary(
         "  --massive-curated-dir data/manual_backfill/massive_curated_sample \\",
         "  --output-dir data/manual_backfill \\",
         "  --symbols-file config/etf_symbols.example.txt \\",
+        "  --backfill-boundary-mode infer_from_massive \\",
         "  --backfill-end-date 2017-12-31 \\",
         "  --overlap-start-date 2018-01-01 \\",
         "  --overlap-end-date 2026-05-08",
