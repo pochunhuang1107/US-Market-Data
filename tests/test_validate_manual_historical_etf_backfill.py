@@ -47,6 +47,7 @@ def args_for(
     symbols_file: Path,
     dry_run: bool = False,
     boundary_window_days: str = "2",
+    backfill_boundary_mode: str = "fixed",
 ) -> Namespace:
     return Namespace(
         raw_dir=str(raw_dir),
@@ -55,6 +56,7 @@ def args_for(
         output_dir=str(output_dir),
         symbols_file=str(symbols_file),
         backfill_end_date="2017-12-31",
+        backfill_boundary_mode=backfill_boundary_mode,
         overlap_start_date="2018-01-01",
         overlap_end_date="2018-01-03",
         boundary_window_days=boundary_window_days,
@@ -320,6 +322,7 @@ def test_pre_massive_export_rule_and_partition_output(tmp_path: Path) -> None:
     ).exists()
     assert result.coverage_rows[0]["backfill_row_count"] == 1
     assert result.coverage_rows[0]["exported_years"] == "2017"
+    assert result.coverage_rows[0]["backfill_boundary_mode"] == "fixed"
     event_report_rows = read_csv_rows(
         output_dir / "validation" / "event_rows_report.csv"
     )
@@ -330,6 +333,275 @@ def test_pre_massive_export_rule_and_partition_output(tmp_path: Path) -> None:
     )
     assert quality_rows[0]["event_row_count"] == "0"
     assert quality_rows[0]["event_warning"] == ""
+
+
+def test_infer_from_massive_exports_only_rows_before_local_massive_first_date(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(
+        raw_dir / "SPY.csv",
+        [
+            {"date": "2016-01-04", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1},
+            {"date": "2016-03-27", "open": 11, "high": 12, "low": 10, "close": 11, "volume": 1},
+            {"date": "2016-03-28", "open": 12, "high": 13, "low": 11, "close": 12, "volume": 1},
+            {"date": "2017-12-29", "open": 13, "high": 14, "low": 12, "close": 13, "volume": 1},
+        ],
+    )
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2016-03-28",
+                "year": 2016,
+                "month": 3,
+                "symbol": "SPY",
+                "open": 12.0,
+                "high": 13.0,
+                "low": 11.0,
+                "close": 12.0,
+                "volume": 1.0,
+                "vwap": None,
+                "transactions": None,
+            }
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            backfill_boundary_mode="infer_from_massive",
+        )
+    )
+
+    export_path = (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+        / "symbol=SPY"
+        / "year=2016"
+        / "data.parquet"
+    )
+    exported_rows = pq.ParquetFile(export_path).read().to_pylist()
+    assert [row["date"] for row in exported_rows] == ["2016-01-04", "2016-03-27"]
+    assert result.coverage_rows[0]["backfill_row_count"] == 2
+    assert result.coverage_rows[0]["massive_first_available_date"] == "2016-03-28"
+    assert result.coverage_rows[0]["source_backfill_end_date"] == "2016-03-27"
+    assert not (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+        / "symbol=SPY"
+        / "year=2017"
+        / "data.parquet"
+    ).exists()
+
+
+def test_infer_from_massive_writes_massive_boundary_report_and_merge_flag(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(
+        raw_dir / "SPY.csv",
+        [
+            {"date": "2016-01-04", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1},
+            {"date": "2016-03-27", "open": 11, "high": 12, "low": 10, "close": 11, "volume": 1},
+            {"date": "2016-03-28", "open": 12, "high": 13, "low": 11, "close": 12, "volume": 1},
+        ],
+    )
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2016-03-28",
+                "year": 2016,
+                "month": 3,
+                "symbol": "SPY",
+                "open": 12.0,
+                "high": 13.0,
+                "low": 11.0,
+                "close": 12.0,
+                "volume": 1.0,
+                "vwap": None,
+                "transactions": None,
+            }
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            backfill_boundary_mode="infer_from_massive",
+        )
+    )
+
+    report_path = output_dir / "validation" / "massive_boundary_report.csv"
+    report_rows = read_csv_rows(report_path)
+    assert report_path.exists()
+    assert result.manifest["report_paths"]["massive_boundary"] == str(report_path)
+    assert result.manifest["backfill_boundary_mode"] == "infer_from_massive"
+    assert report_rows[0]["massive_first_available_date"] == "2016-03-28"
+    assert report_rows[0]["source_backfill_end_date"] == "2016-03-27"
+    assert report_rows[0]["boundary_status"] == "inferred_from_massive"
+    assert report_rows[0]["requires_merge_with_existing_partition"] == "True"
+
+
+def test_infer_from_massive_start_of_year_boundary_does_not_require_merge(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(
+        raw_dir / "SPY.csv",
+        [
+            {"date": "2015-12-31", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1},
+            {"date": "2016-01-01", "open": 11, "high": 12, "low": 10, "close": 11, "volume": 1},
+        ],
+    )
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2016-01-01",
+                "year": 2016,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 11.0,
+                "high": 12.0,
+                "low": 10.0,
+                "close": 11.0,
+                "volume": 1.0,
+                "vwap": None,
+                "transactions": None,
+            }
+        ],
+    )
+
+    validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            backfill_boundary_mode="infer_from_massive",
+        )
+    )
+
+    report_rows = read_csv_rows(output_dir / "validation" / "massive_boundary_report.csv")
+    assert report_rows[0]["source_backfill_end_date"] == "2015-12-31"
+    assert report_rows[0]["export_row_count"] == "1"
+    assert report_rows[0]["requires_merge_with_existing_partition"] == "False"
+
+
+def test_infer_from_massive_missing_sample_exports_no_source_history(
+    tmp_path: Path,
+) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(
+        raw_dir / "SPY.csv",
+        [
+            {"date": "2010-01-04", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1},
+            {"date": "2017-12-29", "open": 11, "high": 12, "low": 10, "close": 11, "volume": 1},
+        ],
+    )
+
+    result = validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            backfill_boundary_mode="infer_from_massive",
+        )
+    )
+
+    export_root = (
+        output_dir
+        / "curated_export"
+        / "source=stooq"
+        / "etf_daily_prices"
+    )
+    report_rows = read_csv_rows(output_dir / "validation" / "massive_boundary_report.csv")
+    assert not list(export_root.glob("symbol=*/year=*/data.parquet"))
+    assert result.coverage_rows[0]["backfill_row_count"] == 0
+    assert report_rows[0]["boundary_status"] == "missing_massive_sample"
+    assert report_rows[0]["source_backfill_end_date"] == ""
+    assert report_rows[0]["export_row_count"] == "0"
+
+
+def test_coverage_report_includes_boundary_columns(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw" / "stooq"
+    massive_dir = tmp_path / "massive"
+    output_dir = tmp_path / "out"
+    symbols_file = tmp_path / "symbols.txt"
+    write_symbols(symbols_file, ["SPY"])
+    write_csv(raw_dir / "SPY.csv", sample_raw_rows())
+    write_massive_sample(
+        massive_dir,
+        "SPY",
+        [
+            {
+                "date": "2018-01-02",
+                "year": 2018,
+                "month": 1,
+                "symbol": "SPY",
+                "open": 102.0,
+                "high": 105.0,
+                "low": 101.0,
+                "close": 104.0,
+                "volume": 11.0,
+                "vwap": None,
+                "transactions": None,
+            }
+        ],
+    )
+
+    validator.run_validation(
+        args_for(
+            tmp_path,
+            raw_dir=raw_dir,
+            massive_curated_dir=massive_dir,
+            output_dir=output_dir,
+            symbols_file=symbols_file,
+            backfill_boundary_mode="infer_from_massive",
+        )
+    )
+
+    coverage_rows = read_csv_rows(output_dir / "validation" / "coverage_report.csv")
+    assert coverage_rows[0]["massive_first_available_date"] == "2018-01-02"
+    assert coverage_rows[0]["source_backfill_end_date"] == "2018-01-01"
+    assert coverage_rows[0]["backfill_boundary_mode"] == "infer_from_massive"
+    assert "requires_merge_with_existing_partition" in coverage_rows[0]
 
 
 def test_overlap_comparison_against_synthetic_massive_curated_sample(tmp_path: Path) -> None:
@@ -823,3 +1095,11 @@ def test_summary_markdown_includes_adjustment_diagnostics_section(tmp_path: Path
     assert "Boundary rebase candidates: SPY" in summary
     assert "No rebasing was performed" in summary
     assert "A later task can create a rebased pre-Massive export only for accepted symbols" in summary
+    assert "## Massive Boundary Export Summary" in summary
+    assert "Boundary mode: `fixed`" in summary
+    assert "Total export rows under selected boundary mode: 2" in summary
+    assert (
+        "In infer_from_massive mode, exported rows are limited to dates before each "
+        "symbol's local Massive first available date."
+    ) in summary
+    assert "No rebasing and no S3 promotion happened in this task." in summary
