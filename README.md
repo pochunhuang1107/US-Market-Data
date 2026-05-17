@@ -190,6 +190,23 @@ python scripts/validate_manual_historical_etf_backfill.py \
   --backfill-boundary-mode infer_from_massive
 ```
 
+If Tiingo has already been downloaded and you need to evaluate a raw-compatible price convention
+without calling Tiingo again, materialize a separate local source from the preserved `raw_*` columns:
+
+```bash
+python scripts/materialize_tiingo_raw_compatible_backfill.py \
+  --input-dir data/manual_backfill/raw/tiingo \
+  --output-dir data/manual_backfill/raw/tiingo_raw_compatible \
+  --symbols-file config/etf_symbols.example.txt \
+  --overwrite
+```
+
+This writes `tiingo_raw_compatible_materialization_manifest.csv` and
+`tiingo_raw_compatible_materialization_summary.md` under `data/manual_backfill/validation/`. It
+does not call external APIs, does not write to S3, does not change Massive automation, and does not
+overwrite the existing Tiingo adjusted source directory. Validate the materialized source with
+`--raw-dir data/manual_backfill/raw/tiingo_raw_compatible` and `--source-provider tiingo_raw`.
+
 Reference series such as VIX and DGS10 belong to the existing `curated/reference_series` workflow,
 not the manual ETF price backfill.
 
