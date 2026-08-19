@@ -134,12 +134,6 @@ def resolve_target_date(event: Any) -> str:
     mode = event.get("mode") if isinstance(event, dict) else None
     ny_now = datetime.now(ZoneInfo("America/New_York")).date()
 
-    if mode == "close":
-        return ny_now.isoformat()
-
-    if mode == "finalize":
-        return (ny_now - timedelta(days=1)).isoformat()
-
     return (ny_now - timedelta(days=1)).isoformat()
 
 
