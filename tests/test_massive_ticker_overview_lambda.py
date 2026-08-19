@@ -80,8 +80,7 @@ def clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "MAX_RETRIES",
         "BASE_SLEEP_SECONDS",
         "MAX_SLEEP_SECONDS",
-        "MASSIVE_API_KEY",
-        "POLYGON_API_KEY",
+        "SECRET_NAME",
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -92,9 +91,22 @@ def configure_handler(
 ) -> FakeS3:
     clear_config_env(monkeypatch)
     monkeypatch.setenv("BUCKET_NAME", "test-bucket")
-    monkeypatch.setenv("MASSIVE_API_KEY", "test-secret")
+    monkeypatch.setenv("SECRET_NAME", "test-secret-name")
     s3_client = fake_s3 or FakeS3()
-    monkeypatch.setattr(lambda_module.boto3, "client", lambda service_name: s3_client)
+
+    class FakeSecretsManager:
+        def get_secret_value(self, SecretId: str) -> dict[str, str]:  # noqa: N803
+            assert SecretId == "test-secret-name"
+            return {"SecretString": '{"api_key": "test-secret"}'}
+
+    def fake_boto3_client(service_name: str) -> object:
+        if service_name == "s3":
+            return s3_client
+        if service_name == "secretsmanager":
+            return FakeSecretsManager()
+        raise AssertionError(f"unexpected boto3 client: {service_name}")
+
+    monkeypatch.setattr(lambda_module.boto3, "client", fake_boto3_client)
     return s3_client
 
 

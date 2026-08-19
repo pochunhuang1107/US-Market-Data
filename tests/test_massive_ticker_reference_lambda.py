@@ -43,8 +43,7 @@ def clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "MAX_RETRIES",
         "BASE_SLEEP_SECONDS",
         "MAX_SLEEP_SECONDS",
-        "MASSIVE_API_KEY",
-        "POLYGON_API_KEY",
+        "SECRET_NAME",
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -52,7 +51,7 @@ def clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def configure_handler_mocks(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     clear_config_env(monkeypatch)
     monkeypatch.setenv("BUCKET_NAME", "test-bucket")
-    monkeypatch.setenv("MASSIVE_API_KEY", "test-secret")
+    monkeypatch.setenv("SECRET_NAME", "test-secret-name")
 
     calls: dict[str, Any] = {
         "s3_client": object(),
@@ -61,9 +60,17 @@ def configure_handler_mocks(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "curated_writes": [],
     }
 
+    class FakeSecretsManager:
+        def get_secret_value(self, SecretId: str) -> dict[str, str]:  # noqa: N803
+            assert SecretId == "test-secret-name"
+            return {"SecretString": '{"api_key": "test-secret"}'}
+
     def fake_boto3_client(service_name: str) -> object:
-        assert service_name == "s3"
-        return calls["s3_client"]
+        if service_name == "s3":
+            return calls["s3_client"]
+        if service_name == "secretsmanager":
+            return FakeSecretsManager()
+        raise AssertionError(f"unexpected boto3 client: {service_name}")
 
     def fake_fetch(**kwargs: object) -> list[dict[str, object]]:
         calls["fetch"].append(kwargs)
@@ -190,12 +197,11 @@ def test_lambda_missing_bucket_name_raises_clear_error(monkeypatch: pytest.Monke
         lambda_module.lambda_handler({}, None)
 
 
-def test_lambda_missing_api_key_raises_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lambda_missing_secret_name_raises_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
     configure_handler_mocks(monkeypatch)
-    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
-    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    monkeypatch.delenv("SECRET_NAME", raising=False)
 
-    with pytest.raises(RuntimeError, match="MASSIVE_API_KEY or POLYGON_API_KEY"):
+    with pytest.raises(ValueError, match="SECRET_NAME environment variable is required"):
         lambda_module.lambda_handler({}, None)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable
 from math import isfinite
@@ -12,7 +13,6 @@ from us_market_data.ticker_reference import (
     fetch_massive_ticker_pages,
     normalize_massive_ticker_payloads,
     parse_bool,
-    resolve_massive_api_key,
     rows_to_table,
     utc_date,
     write_curated_parquet_s3,
@@ -38,6 +38,14 @@ def require_env(name: str) -> str:
     if not value:
         raise ValueError(f"{name} environment variable is required")
     return value
+
+
+def get_api_key() -> str:
+    response = boto3.client("secretsmanager").get_secret_value(
+        SecretId=require_env("SECRET_NAME")
+    )
+    secret = json.loads(response["SecretString"])
+    return secret["api_key"]
 
 
 def event_value(event: Any, name: str, default: object) -> object:
@@ -169,7 +177,7 @@ def resolve_config(event: Any) -> dict[str, object]:
 def lambda_handler(event: Any, context: Any) -> dict[str, Any]:
     del context
     config = resolve_config(event)
-    api_key = resolve_massive_api_key()
+    api_key = get_api_key()
     s3_client = boto3.client("s3")
 
     bucket = str(config["bucket"])
